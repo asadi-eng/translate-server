@@ -431,4 +431,51 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'setLang') {
       // Lets either side change their spoken language mid-session (not just at
-      // create/join time) — relayed to the other sid
+      // create/join time) — relayed to the other side so their translation target
+      // updates immediately, same as it does at join time.
+      const s = sessions.get(ws.code);
+      if (!s) return;
+      if (ws.role === 'host') s.hostLang = msg.lang;
+      if (ws.role === 'guest') s.guestLang = msg.lang;
+      send(otherSide(s, ws.role), { type: 'partnerLangChanged', lang: msg.lang });
+      return;
+    }
+
+    if (msg.type === 'chat') {
+      // relay a translated message straight to the other participant, no storage involved.
+      // fromPhoto marks a message that came from the camera/OCR flow, so the receiving
+      // client knows to render the translation as a tappable PNG instead of plain text.
+      const s = sessions.get(ws.code);
+      if (!s) return;
+      const target = otherSide(s, ws.role);
+      send(target, { type: 'chat', from: ws.role, original: msg.original, translated: msg.translated, fromPhoto: !!msg.fromPhoto });
+      return;
+    }
+
+    if (msg.type === 'leave') {
+      cleanupConnection(ws);
+      return;
+    }
+  });
+
+  ws.on('close', () => cleanupConnection(ws));
+});
+
+function cleanupConnection(ws) {
+  if (!ws.code) return;
+  const s = sessions.get(ws.code);
+  if (!s) return;
+  if (ws.role === 'host') s.host = null;
+  if (ws.role === 'guest') s.guest = null;
+  broadcastPresence(ws.code);
+  // if both sides are gone, free the session
+  if (!s.host && !s.guest) sessions.delete(ws.code);
+}
+
+server.listen(PORT, () => {
+  const status = [
+    ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured',
+    DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
+  ].join(', ');
+  console.log('relay server listening on port ' + PORT + ' — ' + status);
+});
