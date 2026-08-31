@@ -136,6 +136,90 @@ async function translateWithClaude(text, fromCode, toCode) {
   return translated;
 }
 
+// Line-by-line translation for the camera-overlay feature (Google Lens style):
+// each detected OCR line needs its own translated string, in the same order, so
+// the client can redraw each one back on top of the exact spot on the photo where
+// the original line was. Still done as ONE Claude call (not one call per line) so
+// the model can use the whole passage as context and stay natural/coherent —
+// only the *output* is split back into per-line pieces.
+async function translateLinesWithClaude(lines, fromCode, toCode) {
+  if (!ANTHROPIC_API_KEY) throw new Error('no-anthropic-key');
+  const fromName = langName(fromCode);
+  const toName = langName(toCode);
+  const numbered = lines.map((l, i) => (i + 1) + '. ' + String(l).replace(/\s+/g, ' ').trim()).join('\n');
+  const resp = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: Math.min(4000, Math.max(500, lines.length * 150)),
+      system: 'You are the translation engine behind a live camera-overlay translation feature (like Google Lens), ' +
+        'translating text that was detected line-by-line on a photographed image, from ' + fromName + ' to ' + toName + '. ' +
+        'You will receive a numbered list, one detected line of text per number, in the order the lines appear on the ' +
+        'image (top to bottom). Read all the lines together so you understand the full context and meaning, even if a ' +
+        'sentence continues across several lines or a word is split across two lines — but you MUST reply with a ' +
+        'translation for EVERY numbered line, in the exact same order and exact same count as the input, one entry per ' +
+        'original line. Never merge two input lines into one output entry or split one input line into two. If a line ' +
+        'is just a stray character, a number, a logo fragment, or otherwise not real translatable text, still return ' +
+        'an entry for it (repeat it as-is or return an empty string), so the count always matches. Keep each translated ' +
+        'entry reasonably close in length to its original line, since it gets redrawn in that line\'s original space on ' +
+        'the photo. Reply with ONLY a raw JSON array of strings — no markdown, no code fence, no commentary — with ' +
+        'exactly ' + lines.length + ' items in order.',
+      messages: [{ role: 'user', content: numbered }],
+    }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error('claude-lines-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
+  }
+  const data = await resp.json();
+  const block = data && data.content && data.content.find((b) => b.type === 'text');
+  let raw = block && block.text && block.text.trim();
+  if (!raw) throw new Error('claude-lines-bad-response');
+  raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  let arr;
+  try {
+    arr = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('claude-lines-unparsable');
+  }
+  if (!Array.isArray(arr) || arr.length !== lines.length) throw new Error('claude-lines-count-mismatch');
+  return arr.map((s) => (s == null ? '' : String(s).trim()));
+}
+
+// Fallback if the batched Claude call fails or a non-Claude engine is active:
+// translate each line on its own through the normal single-text chain (slower,
+// loses cross-line context, but still produces a correct per-line result).
+async function translateLinesSequentially(lines, fromCode, toCode) {
+  const out = [];
+  let engine = null;
+  for (const line of lines) {
+    const trimmed = String(line).trim();
+    if (!trimmed) { out.push(''); continue; }
+    const r = await translateText(trimmed, fromCode, toCode);
+    out.push(r.translated);
+    engine = engine || r.engine;
+  }
+  return { translated: out, engine: (engine || 'unknown') + '-per-line' };
+}
+
+async function translateLines(lines, fromCode, toCode) {
+  try {
+    const translated = await translateLinesWithClaude(lines, fromCode, toCode);
+    return { translated, engine: 'claude-lines' };
+  } catch (claudeErr) {
+    try {
+      return await translateLinesSequentially(lines, fromCode, toCode);
+    } catch (fallbackErr) {
+      throw new Error('line translation failed — claude: ' + claudeErr.message + ' | fallback: ' + fallbackErr.message);
+    }
+  }
+}
+
 function toDeepLTarget(code) {
   if (code === 'en') return 'EN-US';
   return code.toUpperCase();
@@ -240,43 +324,17 @@ async function translateText(text, fromCode, toCode) {
 // --- server-side TTS (POST /tts) --------------------------------------------
 
 const EDGE_TTS_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
-// Each language has both a female and male neural voice — picked based on the
-// gender detected client-side from whoever spoke (a pitch-based guess, made in the
-// browser since only it has access to the raw mic audio; see createGenderDetector()
-// in index.html). Falls back to the female voice when gender wasn't detected or
-// wasn't sent, exactly matching the previous single-voice behavior.
 const EDGE_VOICES = {
-  'fa-IR':{female:'fa-IR-DilaraNeural', male:'fa-IR-FaridNeural'},
-  'ar-SA':{female:'ar-SA-ZariyahNeural', male:'ar-SA-HamedNeural'},
-  'en-US':{female:'en-US-AriaNeural', male:'en-US-GuyNeural'},
-  'tr-TR':{female:'tr-TR-EmelNeural', male:'tr-TR-AhmetNeural'},
-  'fr-FR':{female:'fr-FR-DeniseNeural', male:'fr-FR-HenriNeural'},
-  'de-DE':{female:'de-DE-KatjaNeural', male:'de-DE-ConradNeural'},
-  'es-ES':{female:'es-ES-ElviraNeural', male:'es-ES-AlvaroNeural'},
-  'it-IT':{female:'it-IT-ElsaNeural', male:'it-IT-DiegoNeural'},
-  'ru-RU':{female:'ru-RU-SvetlanaNeural', male:'ru-RU-DmitryNeural'},
-  'ja-JP':{female:'ja-JP-NanamiNeural', male:'ja-JP-KeitaNeural'},
-  'ko-KR':{female:'ko-KR-SunHiNeural', male:'ko-KR-InJoonNeural'},
-  'hi-IN':{female:'hi-IN-SwaraNeural', male:'hi-IN-MadhurNeural'},
-  'ur-PK':{female:'ur-PK-UzmaNeural', male:'ur-PK-AsadNeural'},
-  'pt-PT':{female:'pt-PT-RaquelNeural', male:'pt-PT-DuarteNeural'},
-  'nl-NL':{female:'nl-NL-ColetteNeural', male:'nl-NL-MaartenNeural'},
-  'sv-SE':{female:'sv-SE-SofieNeural', male:'sv-SE-MattiasNeural'},
-  'pl-PL':{female:'pl-PL-ZofiaNeural', male:'pl-PL-MarekNeural'},
-  'uk-UA':{female:'uk-UA-PolinaNeural', male:'uk-UA-OstapNeural'},
-  'id-ID':{female:'id-ID-GadisNeural', male:'id-ID-ArdiNeural'},
-  'vi-VN':{female:'vi-VN-HoaiMyNeural', male:'vi-VN-NamMinhNeural'},
-  'th-TH':{female:'th-TH-PremwadeeNeural', male:'th-TH-NiwatNeural'},
-  'he-IL':{female:'he-IL-HilaNeural', male:'he-IL-AvriNeural'},
-  'el-GR':{female:'el-GR-AthinaNeural', male:'el-GR-NestorasNeural'},
-  'ro-RO':{female:'ro-RO-AlinaNeural', male:'ro-RO-EmilNeural'},
-  'bn-BD':{female:'bn-BD-NabanitaNeural', male:'bn-BD-PradeepNeural'},
-  'ms-MY':{female:'ms-MY-YasminNeural', male:'ms-MY-OsmanNeural'},
+  'fa-IR':'fa-IR-DilaraNeural', 'ar-SA':'ar-SA-ZariyahNeural', 'en-US':'en-US-AriaNeural',
+  'tr-TR':'tr-TR-EmelNeural', 'fr-FR':'fr-FR-DeniseNeural', 'de-DE':'de-DE-KatjaNeural',
+  'es-ES':'es-ES-ElviraNeural', 'it-IT':'it-IT-ElsaNeural', 'ru-RU':'ru-RU-SvetlanaNeural',
+  'ja-JP':'ja-JP-NanamiNeural', 'ko-KR':'ko-KR-SunHiNeural', 'hi-IN':'hi-IN-SwaraNeural',
+  'ur-PK':'ur-PK-UzmaNeural', 'pt-PT':'pt-PT-RaquelNeural', 'nl-NL':'nl-NL-ColetteNeural',
+  'sv-SE':'sv-SE-SofieNeural', 'pl-PL':'pl-PL-ZofiaNeural', 'uk-UA':'uk-UA-PolinaNeural',
+  'id-ID':'id-ID-GadisNeural', 'vi-VN':'vi-VN-HoaiMyNeural', 'th-TH':'th-TH-PremwadeeNeural',
+  'he-IL':'he-IL-HilaNeural', 'el-GR':'el-GR-AthinaNeural', 'ro-RO':'ro-RO-AlinaNeural',
+  'bn-BD':'bn-BD-NabanitaNeural', 'ms-MY':'ms-MY-YasminNeural',
 };
-function pickEdgeVoice(bcp, gender) {
-  const pair = EDGE_VOICES[bcp] || EDGE_VOICES['en-US'];
-  return (gender === 'male' && pair.male) ? pair.male : pair.female;
-}
 function uuidNoDashes() {
   return 'xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0, v = c === 'x' ? r : (r & 0x3) | 0x8;
@@ -294,9 +352,9 @@ function escapeXml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-function synthesizeEdgeTts(text, bcp, gender) {
+function synthesizeEdgeTts(text, bcp) {
   return new Promise((resolve, reject) => {
-    const voice = pickEdgeVoice(bcp, gender);
+    const voice = EDGE_VOICES[bcp] || EDGE_VOICES['en-US'];
     const gec = edgeSecMsGec();
     const wsUrl = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
       + '?TrustedClientToken=' + EDGE_TTS_TOKEN + '&Sec-MS-GEC=' + gec + '&Sec-MS-GEC-Version=1-131.0.0.0';
@@ -350,7 +408,7 @@ function splitForGoogleTts(text, maxLen) {
   return parts;
 }
 async function synthesizeGoogleTts(text, langCode2) {
-  const chunks = splitForGoogleTts(text, 100).filter((c) => c.trim().length > 0);
+  const chunks = splitForGoogleTts(text, 180);
   const buffers = [];
   for (const chunk of chunks) {
     const url = 'https://translate.googleapis.com/translate_tts?ie=UTF-8&q='
@@ -414,10 +472,34 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && req.url === '/translate-lines') {
+    try {
+      const body = await readJsonBody(req, 40000);
+      const { lines, source, target } = body;
+      if (!Array.isArray(lines) || !lines.length || !source || !target) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'lines (آرایه), source و target لازم است' }));
+        return;
+      }
+      if (lines.length > 60) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'تعداد خط‌ها بیش از حد مجاز است' }));
+        return;
+      }
+      const result = await translateLines(lines.map(String), String(source), String(target));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'ترجمه خط به خط انجام نشد' }));
+    }
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/tts') {
     try {
       const body = await readJsonBody(req, 5000);
-      const { text, bcp, gender } = body;
+      const { text, bcp } = body;
       if (!text || !bcp) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'text و bcp لازم است' }));
@@ -425,12 +507,10 @@ const server = http.createServer(async (req, res) => {
       }
       let audio, engine;
       try {
-        audio = await synthesizeEdgeTts(String(text), String(bcp), gender);
+        audio = await synthesizeEdgeTts(String(text), String(bcp));
         engine = 'edge';
       } catch (edgeErr) {
         try {
-          // Google's TTS endpoint has no voice/gender selection — one fixed voice
-          // per language, so `gender` simply can't be honored on this fallback path.
           audio = await synthesizeGoogleTts(String(text), String(bcp).slice(0, 2));
           engine = 'google-fallback';
         } catch (googleErr) {
@@ -541,7 +621,6 @@ wss.on('connection', (ws) => {
         translated: msg.translated,
         fromPhoto: !!msg.fromPhoto,
         photoPng: msg.photoPng || null,
-        gender: msg.gender || null,
       });
       return;
     }
