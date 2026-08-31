@@ -412,7 +412,7 @@ async function synthesizeGoogleTts(text, langCode2) {
   const buffers = [];
   for (const chunk of chunks) {
     const url = 'https://translate.googleapis.com/translate_tts?ie=UTF-8&q='
-      + encodeURIComponent(chunk) + '&tl=' + encodeURIComponent(langCode2) + '&client=tw-ob';
+      + encodeURIComponent(chunk) + '&tl=' + encodeURIComponent(langCode2)  + '&client=tw-ob';
     const resp = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
     });
@@ -582,6 +582,13 @@ wss.on('connection', (ws) => {
       ws.code = msg.code;
       const partnerLang = msg.role === 'host' ? s.guestLang : s.hostLang;
       send(ws, { type: 'rejoined', code: msg.code, partnerLang });
+      // Deliver anything that arrived while this side's socket was down (screen
+      // off, backgrounded, brief network drop) instead of it being lost for good.
+      if (s.pending && s.pending.length) {
+        const mine = s.pending.filter(p => p.role === msg.role);
+        s.pending = s.pending.filter(p => p.role !== msg.role);
+        for (const p of mine) send(ws, p.payload);
+      }
       broadcastPresence(msg.code);
       return;
     }
@@ -614,14 +621,28 @@ wss.on('connection', (ws) => {
       const s = sessions.get(ws.code);
       if (!s) return;
       const target = otherSide(s, ws.role);
-      send(target, {
+      const payload = {
         type: 'chat',
         from: ws.role,
         original: msg.original,
         translated: msg.translated,
         fromPhoto: !!msg.fromPhoto,
         photoPng: msg.photoPng || null,
-      });
+      };
+      if (target && target.readyState === target.OPEN) {
+        send(target, payload);
+      } else {
+        // The partner's socket is down right now (their screen turned off, the
+        // mobile browser suspended their tab, a brief network drop) — don't just
+        // drop this on the floor. Queue it on the session so it's delivered the
+        // moment they reconnect and rejoin (see 'rejoin' above), same as a real
+        // messaging app would. Capped so a session nobody ever comes back to
+        // doesn't grow unbounded in memory.
+        const targetRole = ws.role === 'host' ? 'guest' : 'host';
+        s.pending = s.pending || [];
+        s.pending.push({ role: targetRole, payload });
+        if (s.pending.length > 200) s.pending.shift();
+      }
       return;
     }
 
