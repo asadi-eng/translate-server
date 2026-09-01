@@ -159,9 +159,20 @@ async function translateWithClaude(text, fromCode, toCode) {
 // only the *output* is split back into per-line pieces.
 async function translateLinesWithClaude(lines, fromCode, toCode) {
   if (!ANTHROPIC_API_KEY) throw new Error('no-anthropic-key');
-  const fromName = langName(fromCode);
-  const toName = langName(toCode);
   const numbered = lines.map((l, i) => (i + 1) + '. ' + String(l).replace(/\s+/g, ' ').trim()).join('\n');
+  let resolvedFromCode = fromCode;
+  if (fromCode === 'auto') {
+    // Detect once, off the whole passage (better signal than any single OCR line),
+    // instead of asking Claude itself to guess — a real detection call lets the
+    // system prompt below name the actual language instead of the word "auto".
+    try {
+      resolvedFromCode = await detectLanguageWithGoogle(lines.join(' '));
+    } catch (e) {
+      resolvedFromCode = null; // couldn't detect — tell Claude to figure it out itself
+    }
+  }
+  const fromName = resolvedFromCode ? langName(resolvedFromCode) : 'whatever language the text below turns out to be (detect it yourself)';
+  const toName = langName(toCode);
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -314,6 +325,24 @@ async function translateWithGoogle(text, fromCode, toCode) {
   return translated;
 }
 
+// Auto-detect the source language of a piece of text — used whenever the client
+// sends fromCode === 'auto' (e.g. "تشخیص خودکار" for typed text, or the photo/OCR
+// flow where the photographed text's language has nothing to do with either
+// chat participant's own selected language). Piggybacks on the same free Google
+// endpoint as translateWithGoogle: passing sl=auto makes Google detect the
+// language itself, and it reports what it detected in data[2] of the response.
+async function detectLanguageWithGoogle(text) {
+  const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=' + encodeURIComponent(text);
+  const resp = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
+  });
+  if (!resp.ok) throw new Error('detect-lang-http-' + resp.status);
+  const data = await resp.json();
+  const detected = data && data[2];
+  if (!detected || typeof detected !== 'string') throw new Error('detect-lang-bad-response');
+  return detected;
+}
+
 async function translateWithLibreTranslate(text, fromCode, toCode) {
   const url = 'https://translate.terraprint.co/translate';
   const controller = new AbortController();
@@ -339,33 +368,54 @@ async function translateWithLibreTranslate(text, fromCode, toCode) {
   }
 }
 
-async function translateText(text, fromCode, toCode) {
-  try {
-    const translated = await translateWithClaude(text, fromCode, toCode);
-    return { translated, engine: 'claude' };
-  } catch (claudeErr) {
+// Runs the engines that need an explicit source-language code (Claude, Workers
+// AI, DeepL) followed by the two that can work with any string (Google, Libre),
+// stopping at the first one that succeeds. Used for both a resolved real
+// language code AND, as a last resort, the literal string 'auto' itself (Google
+// and LibreTranslate both understand 'auto' natively, so translation can still
+// go through even when detection above failed).
+async function runEngineChain(text, sourceCode, toCode, engineNames) {
+  const ENGINES = {
+    'claude': () => translateWithClaude(text, sourceCode, toCode),
+    'workers-ai-fallback': () => translateWithWorkersAI(text, sourceCode, toCode),
+    'deepl-fallback': () => translateWithDeepL(text, sourceCode, toCode),
+    'google-fallback': () => translateWithGoogle(text, sourceCode, toCode),
+    'libretranslate-fallback': () => translateWithLibreTranslate(text, sourceCode, toCode),
+  };
+  const errors = {};
+  for (const name of engineNames) {
     try {
-      const translated = await translateWithWorkersAI(text, fromCode, toCode);
-      return { translated, engine: 'workers-ai-fallback', claudeError: claudeErr.message };
-    } catch (workersAiErr) {
-      try {
-        const translated = await translateWithDeepL(text, fromCode, toCode);
-        return { translated, engine: 'deepl-fallback', claudeError: claudeErr.message, workersAiError: workersAiErr.message };
-      } catch (deeplErr) {
-        try {
-          const translated = await translateWithGoogle(text, fromCode, toCode);
-          return { translated, engine: 'google-fallback', claudeError: claudeErr.message, workersAiError: workersAiErr.message, deeplError: deeplErr.message };
-        } catch (googleErr) {
-          try {
-            const translated = await translateWithLibreTranslate(text, fromCode, toCode);
-            return { translated, engine: 'libretranslate-fallback', claudeError: claudeErr.message, workersAiError: workersAiErr.message, deeplError: deeplErr.message, googleError: googleErr.message };
-          } catch (libreErr) {
-            throw new Error('all engines failed — claude: ' + claudeErr.message + ' | workers-ai: ' + workersAiErr.message + ' | deepl: ' + deeplErr.message + ' | google: ' + googleErr.message + ' | libretranslate: ' + libreErr.message);
-          }
-        }
-      }
+      const translated = await ENGINES[name]();
+      return { translated, engine: name, errors };
+    } catch (err) {
+      errors[name] = err.message;
     }
   }
+  const summary = Object.entries(errors).map(([k, v]) => k + ': ' + v).join(' | ');
+  throw new Error('all engines failed — ' + summary);
+}
+
+async function translateText(text, fromCode, toCode) {
+  if (fromCode !== 'auto') {
+    const result = await runEngineChain(text, fromCode, toCode,
+      ['claude', 'workers-ai-fallback', 'deepl-fallback', 'google-fallback', 'libretranslate-fallback']);
+    return { translated: result.translated, engine: result.engine, ...result.errors };
+  }
+
+  // fromCode === 'auto': try to actually detect the real language first, so
+  // Claude/Workers AI/DeepL (which all need a real code, not the word "auto")
+  // can still be used. Only if detection itself fails do we fall through to
+  // Google/Libre with the literal 'auto', since those two can detect internally.
+  let detectedLang = null;
+  try {
+    detectedLang = await detectLanguageWithGoogle(text);
+  } catch (detectErr) {
+    const result = await runEngineChain(text, 'auto', toCode, ['google-fallback', 'libretranslate-fallback']);
+    return { translated: result.translated, engine: result.engine + '-undetected', detectError: detectErr.message, ...result.errors };
+  }
+  const result = await runEngineChain(text, detectedLang, toCode,
+    ['claude', 'workers-ai-fallback', 'deepl-fallback', 'google-fallback', 'libretranslate-fallback']);
+  return { translated: result.translated, engine: result.engine, detectedLang, ...result.errors };
 }
 
 // --- server-side TTS (POST /tts) --------------------------------------------
@@ -406,7 +456,7 @@ function synthesizeEdgeTts(text, bcp) {
     const wsUrl = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
       + '?TrustedClientToken=' + EDGE_TTS_TOKEN + '&Sec-MS-GEC=' + gec + '&Sec-MS-GEC-Version=1-131.0.0.0';
     let ws;
-   try { ws = new WebSocket(wsUrl); } catch (e) { reject(e); return; }
+    try { ws = new WebSocket(wsUrl); } catch (e) { reject(e); return; }
     const audioParts = [];
     let settled = false;
     const timer = setTimeout(() => finish(reject, new Error('edge-timeout')), Math.max(8000, text.length * 150));
@@ -663,7 +713,8 @@ wss.on('connection', (ws) => {
 
     if (msg.type === 'chat') {
       // fromPhoto marks a message that came from the camera/OCR flow; when it does,
-      // photoPng (a data: URL) carries the already-translated image and
+      // photoPng (a data: URL) carries the already-translated image, photoPngOriginal
+      // carries the clean untouched photo (for the client's اصلی/ترجمه toggle), and
       // original/translated text are omitted entirely — the photo IS the message,
       // not a caption alongside it.
       const s = sessions.get(ws.code);
@@ -676,6 +727,7 @@ wss.on('connection', (ws) => {
         translated: msg.translated,
         fromPhoto: !!msg.fromPhoto,
         photoPng: msg.photoPng || null,
+        photoPngOriginal: msg.photoPngOriginal || null,
       };
       if (target && target.readyState === target.OPEN) {
         send(target, payload);
@@ -736,4 +788,4 @@ server.listen(PORT, () => {
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 });
-                                                                
+  
