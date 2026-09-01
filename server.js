@@ -8,7 +8,8 @@
 // - Tracks who's online so both sides can show a live connection status
 //
 // HTTP translation proxy (POST /translate):
-// - Order: Claude (if ANTHROPIC_API_KEY is set) → DeepL (if DEEPL_API_KEY is set) →
+// - Order: Claude (if ANTHROPIC_API_KEY is set) → Cloudflare Workers AI (if
+// CF_ACCOUNT_ID + CF_API_TOKEN are set) → DeepL (if DEEPL_API_KEY is set) →
 // Google Translate → LibreTranslate. Google Translate was added because, without
 // either optional key configured, translations were falling all the way through to
 // LibreTranslate — which is free and reliable but noticeably lower quality than
@@ -65,6 +66,20 @@ const DEEPL_API_KEY = process.env.DEEPL_API_KEY || '';
 const DEEPL_BASE = DEEPL_API_KEY.endsWith(':fx')
   ? 'https://api-free.deepl.com'
   : 'https://api.deepl.com';
+
+// Cloudflare Workers AI — called here over Cloudflare's plain REST API, NOT by
+// running this code inside an actual Worker. That REST endpoint is reachable from
+// any server (this one included, even though it lives on Render, not Cloudflare)
+// with just an account ID + an API token — no Worker deployment, no binding, no
+// credit card. Free tier: 10,000 "neurons"/day, roughly a few hundred short
+// translation calls. Get CF_ACCOUNT_ID from the URL/sidebar of any page in the
+// Cloudflare dashboard, and CF_API_TOKEN from My Profile → API Tokens → Create
+// Token → grant it the "Workers AI" (Read/Edit) permission.
+const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
+const CF_API_TOKEN = process.env.CF_API_TOKEN || '';
+// m2m100-1.2b is a dedicated many-to-many translation model (not a chat model
+// being asked to translate) and supports Persian/Urdu directly.
+const CF_TRANSLATE_MODEL = '@cf/meta/m2m100-1.2b';
 
 // sessions: Map<code, { host: ws|null, guest: ws|null, hostLang, guestLang }>
 const sessions = new Map();
@@ -220,6 +235,33 @@ async function translateLines(lines, fromCode, toCode) {
   }
 }
 
+async function translateWithWorkersAI(text, fromCode, toCode) {
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) throw new Error('no-workers-ai-credentials');
+  const resp = await fetch(
+    'https://api.cloudflare.com/client/v4/accounts/' + CF_ACCOUNT_ID + '/ai/run/' + CF_TRANSLATE_MODEL,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + CF_API_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text, source_lang: fromCode, target_lang: toCode }),
+    }
+  );
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error('workers-ai-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
+  }
+  const data = await resp.json();
+  if (!data || data.success === false) {
+    const apiErr = data && data.errors && data.errors[0] && data.errors[0].message;
+    throw new Error('workers-ai-api-error' + (apiErr ? ': ' + apiErr : ''));
+  }
+  const translated = data && data.result && data.result.translated_text;
+  if (!translated) throw new Error('workers-ai-bad-response');
+  return translated;
+}
+
 function toDeepLTarget(code) {
   if (code === 'en') return 'EN-US';
   return code.toUpperCase();
@@ -303,18 +345,23 @@ async function translateText(text, fromCode, toCode) {
     return { translated, engine: 'claude' };
   } catch (claudeErr) {
     try {
-      const translated = await translateWithDeepL(text, fromCode, toCode);
-      return { translated, engine: 'deepl-fallback', claudeError: claudeErr.message };
-    } catch (deeplErr) {
+      const translated = await translateWithWorkersAI(text, fromCode, toCode);
+      return { translated, engine: 'workers-ai-fallback', claudeError: claudeErr.message };
+    } catch (workersAiErr) {
       try {
-        const translated = await translateWithGoogle(text, fromCode, toCode);
-        return { translated, engine: 'google-fallback', claudeError: claudeErr.message, deeplError: deeplErr.message };
-      } catch (googleErr) {
+        const translated = await translateWithDeepL(text, fromCode, toCode);
+        return { translated, engine: 'deepl-fallback', claudeError: claudeErr.message, workersAiError: workersAiErr.message };
+      } catch (deeplErr) {
         try {
-          const translated = await translateWithLibreTranslate(text, fromCode, toCode);
-          return { translated, engine: 'libretranslate-fallback', claudeError: claudeErr.message, deeplError: deeplErr.message, googleError: googleErr.message };
-        } catch (libreErr) {
-          throw new Error('all engines failed — claude: ' + claudeErr.message + ' | deepl: ' + deeplErr.message + ' | google: ' + googleErr.message + ' | libretranslate: ' + libreErr.message);
+          const translated = await translateWithGoogle(text, fromCode, toCode);
+          return { translated, engine: 'google-fallback', claudeError: claudeErr.message, workersAiError: workersAiErr.message, deeplError: deeplErr.message };
+        } catch (googleErr) {
+          try {
+            const translated = await translateWithLibreTranslate(text, fromCode, toCode);
+            return { translated, engine: 'libretranslate-fallback', claudeError: claudeErr.message, workersAiError: workersAiErr.message, deeplError: deeplErr.message, googleError: googleErr.message };
+          } catch (libreErr) {
+            throw new Error('all engines failed — claude: ' + claudeErr.message + ' | workers-ai: ' + workersAiErr.message + ' | deepl: ' + deeplErr.message + ' | google: ' + googleErr.message + ' | libretranslate: ' + libreErr.message);
+          }
         }
       }
     }
@@ -359,7 +406,7 @@ function synthesizeEdgeTts(text, bcp) {
     const wsUrl = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
       + '?TrustedClientToken=' + EDGE_TTS_TOKEN + '&Sec-MS-GEC=' + gec + '&Sec-MS-GEC-Version=1-131.0.0.0';
     let ws;
-    try { ws = new WebSocket(wsUrl); } catch (e) { reject(e); return; }
+   try { ws = new WebSocket(wsUrl); } catch (e) { reject(e); return; }
     const audioParts = [];
     let settled = false;
     const timer = setTimeout(() => finish(reject, new Error('edge-timeout')), Math.max(8000, text.length * 150));
@@ -529,6 +576,7 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   const status = [
     ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured',
+    (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI configured' : 'Workers AI NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
     'Google Translate + LibreTranslate fallbacks always available (no key needed)',
     'Edge TTS + Google TTS fallback available at POST /tts',
@@ -683,7 +731,9 @@ function endSession(code, byRole) {
 server.listen(PORT, () => {
   const status = [
     ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured',
+    (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI configured' : 'Workers AI NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 });
+                                                                
