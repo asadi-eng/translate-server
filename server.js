@@ -381,6 +381,35 @@ async function translateText(text, fromCode, toCode) {
 
 // --- server-side TTS (POST /tts) --------------------------------------------
 
+// ElevenLabs — tried first when configured (best quality of the three engines
+// here). Needs just an API key from elevenlabs.io → Profile → API Keys.
+// ELEVENLABS_VOICE_ID is optional; defaults to "Rachel", one of ElevenLabs'
+// stock voices available on every account. eleven_multilingual_v2 auto-detects
+// the spoken language from the text itself, so no per-language voice map is
+// needed the way Edge TTS requires one.
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+async function synthesizeElevenLabsTts(text) {
+  if (!ELEVENLABS_API_KEY) throw new Error('no-elevenlabs-key');
+  const resp = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + ELEVENLABS_VOICE_ID, {
+    method: 'POST',
+    headers: {
+    'xi-api-key': ELEVENLABS_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'audio/mpeg',
+    },
+    body: JSON.stringify({
+      text,
+      model_id: 'eleven_multilingual_v2',
+    }),
+  });
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => '');
+    throw new Error('elevenlabs-http-' + resp.status + (detail ? ': ' + detail.slice(0, 200) : ''));
+  }
+  return Buffer.from(await resp.arrayBuffer());
+}
+
 const EDGE_TTS_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 const EDGE_VOICES = {
   'fa-IR':'fa-IR-DilaraNeural', 'ar-SA':'ar-SA-ZariyahNeural', 'en-US':'en-US-AriaNeural',
@@ -565,14 +594,19 @@ const server = http.createServer(async (req, res) => {
       }
       let audio, engine;
       try {
-        audio = await synthesizeEdgeTts(String(text), String(bcp));
-        engine = 'edge';
-      } catch (edgeErr) {
+        audio = await synthesizeElevenLabsTts(String(text));
+        engine = 'elevenlabs';
+      } catch (elevenErr) {
         try {
-          audio = await synthesizeGoogleTts(String(text), String(bcp).slice(0, 2));
-          engine = 'google-fallback';
-        } catch (googleErr) {
-          throw new Error('edge: ' + edgeErr.message + ' | google: ' + googleErr.message);
+          audio = await synthesizeEdgeTts(String(text), String(bcp));
+          engine = 'edge';
+        } catch (edgeErr) {
+          try {
+            audio = await synthesizeGoogleTts(String(text), String(bcp).slice(0, 2));
+            engine = 'google-fallback';
+          } catch (googleErr) {
+            throw new Error('elevenlabs: ' + elevenErr.message + ' | edge: ' + edgeErr.message + ' | google: ' + googleErr.message);
+          }
         }
       }
       res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'X-TTS-Engine': engine });
@@ -590,6 +624,7 @@ const server = http.createServer(async (req, res) => {
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI configured' : 'Workers AI NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
     'Google Translate + LibreTranslate fallbacks always available (no key needed)',
+    ELEVENLABS_API_KEY ? 'ElevenLabs TTS configured' : 'ElevenLabs TTS NOT configured',
     'Edge TTS + Google TTS fallback available at POST /tts',
   ].join(', ');
   res.end('translation relay server is running (' + status + ')');
@@ -744,6 +779,7 @@ server.listen(PORT, () => {
     ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured',
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI configured' : 'Workers AI NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
+    ELEVENLABS_API_KEY ? 'ElevenLabs TTS configured' : 'ElevenLabs TTS NOT configured',
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 });
