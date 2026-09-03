@@ -153,6 +153,15 @@ async function translateWithClaude(text, fromCode, toCode) {
         'this situation: natural word order, idiomatic expressions, and everyday grammar for that language, over a ' +
         'construction that just mirrors the source sentence structure. Keep it smooth, clear, and polished, but stay ' +
         'faithful to what was actually said — don\'t add information, soften/harden the tone, or change the meaning. ' +
+        'This same engine is also used to translate this app\'s own short interface text (button labels, toggle captions, ' +
+        'status hints) — not just spoken conversation. If the input is clearly a short UI label or button/action text ' +
+        '(a single word or brief phrase, not a full spoken sentence — things like "Close", "Cancel", "Confirm", "Retry", ' +
+        '"Listening..."), translate it into the standard, idiomatic wording that app in that language actually uses for ' +
+        'that control — the normal imperative/label convention of that language\'s software, never a literal or spoken-out ' +
+        'paraphrase (a "Close" button must read as that language\'s normal button word for closing something, not as an ' +
+        'infinitive phrase like "to close" or a full sentence about closing it). ' +
+        'Never translate or alter digits, numbers, dates, prices, codes, or standalone symbols — copy them through exactly ' +
+        'as they appear in the source text; only translate the surrounding words. ' +
         'Reply with ONLY the translated text — no quotation marks, no notes, no alternate options, no explanations.',
       messages: [{ role: 'user', content: text }],
     }),
@@ -197,10 +206,15 @@ async function translateLinesWithClaude(lines, fromCode, toCode) {
         'translation for EVERY numbered line, in the exact same order and exact same count as the input, one entry per ' +
         'original line. Never merge two input lines into one output entry or split one input line into two. If a line ' +
         'is just a stray character, a number, a logo fragment, or otherwise not real translatable text, still return ' +
-        'an entry for it (repeat it as-is or return an empty string), so the count always matches. Keep each translated ' +
-        'entry reasonably close in length to its original line, since it gets redrawn in that line\'s original space on ' +
-        'the photo. Reply with ONLY a raw JSON array of strings — no markdown, no code fence, no commentary — with ' +
-        'exactly ' + lines.length + ' items in order.',
+        'an entry for it (repeat it as-is or return an empty string), so the count always matches. ' +
+        'Translate each line the way a skilled bilingual native speaker would naturally phrase it — smooth, idiomatic, ' +
+        'sentence-by-sentence phrasing in the target language, never a stiff word-for-word rendering — while still using ' +
+        'the full surrounding passage as context so terminology and tone stay consistent across lines. ' +
+        'Never translate or alter digits, numbers, dates, prices, step counters (like "01" or "2/4"), codes, or standalone ' +
+        'symbols/logos — copy them through exactly as they appear in the source line; only translate the actual words ' +
+        'around them. Keep each translated entry reasonably close in length to its original line, since it gets redrawn ' +
+        'in that line\'s original space on the photo. Reply with ONLY a raw JSON array of strings — no markdown, no code ' +
+        'fence, no commentary — with exactly ' + lines.length + ' items in order.',
       messages: [{ role: 'user', content: numbered }],
     }),
   });
@@ -394,7 +408,7 @@ async function translateWithLibreTranslate(text, fromCode, toCode) {
 
 async function translateText(text, fromCode, toCode) {
   try {
-   const translated = await translateWithClaude(text, fromCode, toCode);
+    const translated = await translateWithClaude(text, fromCode, toCode);
     return { translated, engine: 'claude' };
   } catch (claudeErr) {
     try {
@@ -800,7 +814,7 @@ wss.on('connection', (ws) => {
         // mobile browser suspended their tab, a brief network drop) — don't just
         // drop this on the floor. Queue it on the session so it's delivered the
         // moment they reconnect and rejoin (see 'rejoin' above), same as a real
-        // messaging app would. Capped so a session nobody ever comes back to
+ // messaging app would. Capped so a session nobody ever comes back to
         // doesn't grow unbounded in memory.
         const targetRole = ws.role === 'host' ? 'guest' : 'host';
         s.pending = s.pending || [];
@@ -853,4 +867,5 @@ server.listen(PORT, () => {
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 });
-   
+
+      
