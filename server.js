@@ -160,8 +160,11 @@ async function translateWithClaude(text, fromCode, toCode) {
         'that control — the normal imperative/label convention of that language\'s software, never a literal or spoken-out ' +
         'paraphrase (a "Close" button must read as that language\'s normal button word for closing something, not as an ' +
         'infinitive phrase like "to close" or a full sentence about closing it). ' +
-        'Never translate or alter digits, numbers, dates, prices, codes, or standalone symbols — copy them through exactly ' +
-        'as they appear in the source text; only translate the surrounding words. ' +
+        'Never translate or alter numerals written as figures (e.g. "1", "2024", "۱۲", "50%"), dates, prices, codes, or ' +
+        'standalone symbols — copy those through exactly as they appear in the source text. This does NOT apply to ' +
+        'spelled-out number words ("one", "two", "یک", "دو", "first", "اول") — those are ordinary vocabulary and must be ' +
+        'translated like any other word, into the equivalent number word in the target language. Only translate the ' +
+        'surrounding words around a figure, never the figure itself. ' +
         'Reply with ONLY the translated text — no quotation marks, no notes, no alternate options, no explanations.',
       messages: [{ role: 'user', content: text }],
     }),
@@ -199,21 +202,28 @@ async function translateLinesWithClaude(lines, fromCode, toCode) {
       model: CLAUDE_MODEL,
       max_tokens: Math.min(4000, Math.max(500, lines.length * 150)),
       system: 'You are the translation engine behind a live camera-overlay translation feature (like Google Lens), ' +
-        'translating text that was detected line-by-line on a photographed image, from ' + fromName + ' to ' + toName + '. ' +
-        'You will receive a numbered list, one detected line of text per number, in the order the lines appear on the ' +
-        'image (top to bottom). Read all the lines together so you understand the full context and meaning, even if a ' +
-        'sentence continues across several lines or a word is split across two lines — but you MUST reply with a ' +
-        'translation for EVERY numbered line, in the exact same order and exact same count as the input, one entry per ' +
-        'original line. Never merge two input lines into one output entry or split one input line into two. If a line ' +
-        'is just a stray character, a number, a logo fragment, or otherwise not real translatable text, still return ' +
-        'an entry for it (repeat it as-is or return an empty string), so the count always matches. ' +
-        'Translate each line the way a skilled bilingual native speaker would naturally phrase it — smooth, idiomatic, ' +
-        'sentence-by-sentence phrasing in the target language, never a stiff word-for-word rendering — while still using ' +
-        'the full surrounding passage as context so terminology and tone stay consistent across lines. ' +
-        'Never translate or alter digits, numbers, dates, prices, step counters (like "01" or "2/4"), codes, or standalone ' +
-        'symbols/logos — copy them through exactly as they appear in the source line; only translate the actual words ' +
-        'around them. Keep each translated entry reasonably close in length to its original line, since it gets redrawn ' +
-        'in that line\'s original space on the photo. Reply with ONLY a raw JSON array of strings — no markdown, no code ' +
+        'translating text that was detected on a photographed image, from ' + fromName + ' to ' + toName + '. ' +
+        'You will receive a numbered list. Each number is already a merged block of nearby on-image text that has been ' +
+        'grouped together because it likely forms one running sentence/paragraph/caption — NOT an arbitrary single OCR ' +
+        'line — so treat each numbered entry as a real chunk of prose to translate as a whole, not as an isolated word ' +
+        'or fragment to be guessed at out of context. Read all the entries together so terminology, tone, and any ' +
+        'pronoun/reference that continues from one entry to the next stay consistent — but you MUST reply with a ' +
+        'translation for EVERY numbered entry, in the exact same order and exact same count as the input, one output ' +
+        'entry per input entry. Never merge two input entries into one output entry or split one input entry into two. ' +
+        'If an entry is just a stray character, a number, a logo fragment, or otherwise not real translatable text, ' +
+        'still return an entry for it (repeat it as-is or return an empty string), so the count always matches. ' +
+        'Translate each entry the way a skilled bilingual native speaker would naturally phrase it — smooth, idiomatic, ' +
+        'full-sentence phrasing in the target language, never a stiff word-for-word rendering, and never a fragment ' +
+        'that only makes sense chained to a neighboring entry. Watch for words that are ambiguous in isolation but not ' +
+        'in context (e.g. a verb that can mean either "want/like to" or "love", depending on what follows it) — use the ' +
+        'surrounding entries to pick the sense that actually fits, rather than defaulting to the most literal one. ' +
+        'Never translate or alter numerals written as figures (e.g. "1", "2024", "۱۲", "01", "2/4"), dates, prices, codes, ' +
+        'or standalone symbols/logos — copy those through exactly as they appear in the source text. This does NOT apply ' +
+        'to spelled-out number words ("one", "two", "یک", "دو", "سه") — those are ordinary vocabulary and must be ' +
+        'translated like any other word, into the equivalent number word in the target language. Only translate the ' +
+        'surrounding words around a figure, never the figure itself. Each translated entry gets redrawn as one block covering the merged area its source text occupied ' +
+        'on the photo, so it does NOT need to match the original\'s length line-for-line — prioritize a natural, correctly ' +
+        'worded sentence over matching length. Reply with ONLY a raw JSON array of strings — no markdown, no code ' +
         'fence, no commentary — with exactly ' + lines.length + ' items in order.',
       messages: [{ role: 'user', content: numbered }],
     }),
@@ -867,5 +877,3 @@ server.listen(PORT, () => {
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 });
-
-      
