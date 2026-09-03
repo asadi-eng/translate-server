@@ -80,6 +80,12 @@ const CF_API_TOKEN = process.env.CF_API_TOKEN || '';
 // m2m100-1.2b is a dedicated many-to-many translation model (not a chat model
 // being asked to translate) and supports Persian/Urdu directly.
 const CF_TRANSLATE_MODEL = '@cf/meta/m2m100-1.2b';
+// Whisper large-v3-turbo — also on Workers AI, same account/token as translation
+// above, same free daily neuron allowance, no separate signup or card needed.
+// Used by POST /transcribe for the "record a voice message" feature: the client
+// records audio with MediaRecorder (not the browser's live SpeechRecognition),
+// uploads it here as base64, and gets back plain text.
+const CF_WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
 
 // sessions: Map<code, { host: ws|null, guest: ws|null, hostLang, guestLang }>
 const sessions = new Map();
@@ -142,12 +148,11 @@ async function translateWithClaude(text, fromCode, toCode) {
       max_tokens: 500,
       system: 'You are the translation engine inside a live speech-translation app used for real spoken conversation. ' +
         'Translate the user\'s message from ' + fromName + ' to ' + toName + '. ' +
-        'The source text comes from speech recognition, so for Persian, Arabic, Urdu, and Hebrew it arrives WITHOUT ' +
-        'diacritics/vowel marks (as those scripts are normally written) — short words that differ only by an unwritten ' +
-        'vowel mark (e.g. Persian "کی" = "who" spoken "ke" vs. "when" spoken "key") are genuinely ambiguous in isolation. ' +
-        'Resolve these the way a fluent native speaker reading the same undotted text would: from the grammar and ' +
-        'meaning of the whole sentence, not by defaulting to the single most common reading. ' +
-        'Preserve tone and meaning naturally, the way a fluent bilingual interpreter would speak it out loud. ' +
+        'Preserve tone, register, and meaning naturally, the way a skilled fluent bilingual interpreter would speak it out ' +
+        'loud — not a stiff, literal, word-for-word rendering. Favor the phrasing a native speaker would actually say in ' +
+        'this situation: natural word order, idiomatic expressions, and everyday grammar for that language, over a ' +
+        'construction that just mirrors the source sentence structure. Keep it smooth, clear, and polished, but stay ' +
+        'faithful to what was actually said — don\'t add information, soften/harden the tone, or change the meaning. ' +
         'Reply with ONLY the translated text — no quotation marks, no notes, no alternate options, no explanations.',
       messages: [{ role: 'user', content: text }],
     }),
@@ -186,9 +191,6 @@ async function translateLinesWithClaude(lines, fromCode, toCode) {
       max_tokens: Math.min(4000, Math.max(500, lines.length * 150)),
       system: 'You are the translation engine behind a live camera-overlay translation feature (like Google Lens), ' +
         'translating text that was detected line-by-line on a photographed image, from ' + fromName + ' to ' + toName + '. ' +
-        'For Persian, Arabic, Urdu, or Hebrew source text, remember these scripts are normally printed without ' +
-        'diacritics/vowel marks, so a short word can be genuinely ambiguous on its own — resolve it from the ' +
-        'surrounding lines\' context the way a fluent native reader would, not by defaulting to the most common reading. ' +
         'You will receive a numbered list, one detected line of text per number, in the order the lines appear on the ' +
         'image (top to bottom). Read all the lines together so you understand the full context and meaning, even if a ' +
         'sentence continues across several lines or a word is split across two lines — but you MUST reply with a ' +
@@ -281,6 +283,38 @@ async function translateWithWorkersAI(text, fromCode, toCode) {
   return translated;
 }
 
+async function transcribeWithWorkersAI(base64Audio, languageHint) {
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) throw new Error('no-workers-ai-credentials');
+  const payload = { audio: base64Audio };
+  // languageHint is one of our own two-letter LANGS codes (fa, ar, en, ...), which
+  // are already valid ISO 639-1 codes — no mapping needed. Omitted entirely if not
+  // given, in which case Whisper auto-detects the spoken language itself.
+  if (languageHint) payload.language = languageHint;
+  const resp = await fetch(
+    'https://api.cloudflare.com/client/v4/accounts/' + CF_ACCOUNT_ID + '/ai/run/' + CF_WHISPER_MODEL,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + CF_API_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error('workers-ai-whisper-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
+  }
+  const data = await resp.json();
+  if (!data || data.success === false) {
+    const apiErr = data && data.errors && data.errors[0] && data.errors[0].message;
+    throw new Error('workers-ai-whisper-api-error' + (apiErr ? ': ' + apiErr : ''));
+  }
+  const text = data && data.result && data.result.text;
+  if (typeof text !== 'string') throw new Error('workers-ai-whisper-bad-response');
+  return text.trim();
+}
+
 function toDeepLTarget(code) {
   if (code === 'en') return 'EN-US';
   return code.toUpperCase();
@@ -360,7 +394,7 @@ async function translateWithLibreTranslate(text, fromCode, toCode) {
 
 async function translateText(text, fromCode, toCode) {
   try {
-    const translated = await translateWithClaude(text, fromCode, toCode);
+   const translated = await translateWithClaude(text, fromCode, toCode);
     return { translated, engine: 'claude' };
   } catch (claudeErr) {
     try {
@@ -381,8 +415,8 @@ async function translateText(text, fromCode, toCode) {
           } catch (libreErr) {
             throw new Error('all engines failed — claude: ' + claudeErr.message + ' | workers-ai: ' + workersAiErr.message + ' | deepl: ' + deeplErr.message + ' | google: ' + googleErr.message + ' | libretranslate: ' + libreErr.message);
           }
-}
         }
+      }
     }
   }
 }
@@ -591,6 +625,33 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && req.url === '/transcribe') {
+    try {
+      // Base64 audio for a short voice message (recording is capped to 90s
+      // client-side) comfortably fits well under this — the cap just guards
+      // against something huge/broken being posted here.
+      const body = await readJsonBody(req, 15 * 1024 * 1024);
+      const { audio, language } = body;
+      if (!audio) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'audio (base64) لازم است' }));
+        return;
+      }
+      if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'رونویسی صدا تنظیم نشده — CF_ACCOUNT_ID و CF_API_TOKEN را در سرور تنظیم کن' }));
+        return;
+      }
+      const text = await transcribeWithWorkersAI(String(audio), language ? String(language) : undefined);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ text }));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'تبدیل صدا به متن انجام نشد' }));
+    }
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/tts') {
     try {
       const body = await readJsonBody(req, 5000);
@@ -632,6 +693,7 @@ const server = http.createServer(async (req, res) => {
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI configured' : 'Workers AI NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
     'Google Translate + LibreTranslate fallbacks always available (no key needed)',
+    (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Whisper transcription (Workers AI) configured' : 'Whisper transcription (Workers AI) NOT configured',
     ELEVENLABS_API_KEY ? 'ElevenLabs TTS configured' : 'ElevenLabs TTS NOT configured',
     'Edge TTS + Google TTS fallback available at POST /tts',
   ].join(', ');
@@ -791,4 +853,4 @@ server.listen(PORT, () => {
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 });
-    
+   
