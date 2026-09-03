@@ -142,6 +142,11 @@ async function translateWithClaude(text, fromCode, toCode) {
       max_tokens: 500,
       system: 'You are the translation engine inside a live speech-translation app used for real spoken conversation. ' +
         'Translate the user\'s message from ' + fromName + ' to ' + toName + '. ' +
+        'The source text comes from speech recognition, so for Persian, Arabic, Urdu, and Hebrew it arrives WITHOUT ' +
+        'diacritics/vowel marks (as those scripts are normally written) — short words that differ only by an unwritten ' +
+        'vowel mark (e.g. Persian "کی" = "who" spoken "ke" vs. "when" spoken "key") are genuinely ambiguous in isolation. ' +
+        'Resolve these the way a fluent native speaker reading the same undotted text would: from the grammar and ' +
+        'meaning of the whole sentence, not by defaulting to the single most common reading. ' +
         'Preserve tone and meaning naturally, the way a fluent bilingual interpreter would speak it out loud. ' +
         'Reply with ONLY the translated text — no quotation marks, no notes, no alternate options, no explanations.',
       messages: [{ role: 'user', content: text }],
@@ -181,6 +186,9 @@ async function translateLinesWithClaude(lines, fromCode, toCode) {
       max_tokens: Math.min(4000, Math.max(500, lines.length * 150)),
       system: 'You are the translation engine behind a live camera-overlay translation feature (like Google Lens), ' +
         'translating text that was detected line-by-line on a photographed image, from ' + fromName + ' to ' + toName + '. ' +
+        'For Persian, Arabic, Urdu, or Hebrew source text, remember these scripts are normally printed without ' +
+        'diacritics/vowel marks, so a short word can be genuinely ambiguous on its own — resolve it from the ' +
+        'surrounding lines\' context the way a fluent native reader would, not by defaulting to the most common reading. ' +
         'You will receive a numbered list, one detected line of text per number, in the order the lines appear on the ' +
         'image (top to bottom). Read all the lines together so you understand the full context and meaning, even if a ' +
         'sentence continues across several lines or a word is split across two lines — but you MUST reply with a ' +
@@ -373,8 +381,8 @@ async function translateText(text, fromCode, toCode) {
           } catch (libreErr) {
             throw new Error('all engines failed — claude: ' + claudeErr.message + ' | workers-ai: ' + workersAiErr.message + ' | deepl: ' + deeplErr.message + ' | google: ' + googleErr.message + ' | libretranslate: ' + libreErr.message);
           }
+}
         }
-      }
     }
   }
 }
@@ -783,5 +791,4 @@ server.listen(PORT, () => {
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 });
-
-  
+    
