@@ -1,104 +1,39 @@
-// Relay server for the two-device pairing prototype, PLUS a small server-side
-// translation proxy.
-//
-// WebSocket relay (unchanged from before):
-// - Lets one phone create a session (gets a 6-character code)
-// - Lets a second phone join that session using the code
-// - Relays every message between the two phones instantly (no polling delay)
-// - Tracks who's online so both sides can show a live connection status
-//
-// HTTP translation proxy (POST /translate):
-// - Order: Claude (if ANTHROPIC_API_KEY is set) → Cloudflare Workers AI (if
-// CF_ACCOUNT_ID + CF_API_TOKEN are set) → DeepL (if DEEPL_API_KEY is set) →
-// Google Translate → LibreTranslate. Google Translate was added because, without
-// either optional key configured, translations were falling all the way through to
-// LibreTranslate — which is free and reliable but noticeably lower quality than
-// Google, especially for Persian/Urdu, and was the actual cause of "the translation
-// quality is bad" reports. Google Translate's own endpoint here is the same
-// reverse-engineered one everyone's translation tools have used for years (not the
-// paid/licensed Cloud Translation API) — proxied from this server instead of the
-// browser for the same reason as everything else in this section: some visitors'
-// own networks block Google directly, but this server (on Render) reaches it fine.
-// LibreTranslate stays as the final, fully-open-source, zero-dependency fallback in
-// case every other engine is unavailable.
-//
-// HTTP TTS proxy (POST /tts):
-// - Same reasoning, applied to speech: try Microsoft's Edge neural-voice endpoint
-// first (best quality when it works), then fall back to Google Translate's TTS
-// endpoint if Edge fails. Microsoft has been actively tightening/blocking the
-// specific reverse-engineered trick Edge TTS relies on recently (independently
-// confirmed — other open-source projects built on the identical trick have been
-// hitting the same 403 this month), so it can no longer be assumed reliable on its
-// own; Google TTS is the safety net that keeps Persian/Urdu playback working
-// regardless.
-//
-// What this deliberately does NOT do (kept simple on purpose for a prototype):
-// - No persistence — if the server restarts, all sessions are gone (fine for a demo,
-// not fine for a real product; a real product would use Redis or a database)
-// - No auth beyond the session code itself
-// - Only two participants per session (a third joiner replaces the guest slot)
-// - No caching/rate-limiting on /translate — fine for demo traffic, but add some
-// (e.g. a per-IP limiter) before pointing serious traffic at it
-//
-// Deploy this on Render.com (free tier, no credit card): see DEPLOY.md in this folder.
-// ANTHROPIC_API_KEY and DEEPL_API_KEY are both optional — set either (or neither) in
-// Render's dashboard. Google Translate and LibreTranslate always work as free,
-// no-key baselines.
-
 const http = require('http');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
-// Same 'ws' package also works as a plain WebSocket *client* (used below to reach
-// Microsoft's speech endpoint) — WebSocketServer above is only for our own relay.
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 3000;
-
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-// Haiku is intentionally used here (not Sonnet/Opus): translating one short spoken
-// sentence at a time needs to be fast and cheap far more than it needs frontier
-// reasoning, and Haiku 4.5 is Anthropic's current model for exactly that kind of task.
-const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
-
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || '';
-// DeepL free-tier keys end with ":fx" and must be called at api-free.deepl.com;
-// paid keys use api.deepl.com. Detected automatically so you don't have to configure it.
 const DEEPL_BASE = DEEPL_API_KEY.endsWith(':fx')
   ? 'https://api-free.deepl.com'
   : 'https://api.deepl.com';
 
-// Cloudflare Workers AI — called here over Cloudflare's plain REST API, NOT by
-// running this code inside an actual Worker. That REST endpoint is reachable from
-// any server (this one included, even though it lives on Render, not Cloudflare)
-// with just an account ID + an API token — no Worker deployment, no binding, no
-// credit card. Free tier: 10,000 "neurons"/day, roughly a few hundred short
-// translation calls. Get CF_ACCOUNT_ID from the URL/sidebar of any page in the
-// Cloudflare dashboard, and CF_API_TOKEN from My Profile → API Tokens → Create
-// Token → grant it the "Workers AI" (Read/Edit) permission.
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
 const CF_API_TOKEN = process.env.CF_API_TOKEN || '';
-// m2m100-1.2b is a dedicated many-to-many translation model (not a chat model
-// being asked to translate) and supports Persian/Urdu directly.
 const CF_TRANSLATE_MODEL = '@cf/meta/m2m100-1.2b';
-// Whisper large-v3-turbo — also on Workers AI, same account/token as translation
-// above, same free daily neuron allowance, no separate signup or card needed.
-// Used by POST /transcribe for the "record a voice message" feature: the client
-// records audio with MediaRecorder (not the browser's live SpeechRecognition),
-// uploads it here as base64, and gets back plain text.
 const CF_WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
 
-// sessions: Map<code, { host: ws|null, guest: ws|null, hostLang, guestLang }>
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '';
+
 const sessions = new Map();
 
 function makeCode() {
-  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no ambiguous chars (0/O, 1/I/L)
+  const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
   let c = '';
-  for (let i = 0; i < 6; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 6; i++) {
+    c += chars[Math.floor(Math.random() * chars.length)];
+  }
   return c;
 }
 
 function send(ws, obj) {
-  if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+  if (ws && ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
 }
 
 function otherSide(session, role) {
@@ -108,319 +43,282 @@ function otherSide(session, role) {
 function broadcastPresence(code) {
   const s = sessions.get(code);
   if (!s) return;
-  send(s.host, { type: 'presence', partnerOnline: !!(s.guest && s.guest.readyState === s.guest.OPEN) });
-  send(s.guest, { type: 'presence', partnerOnline: !!(s.host && s.host.readyState === s.host.OPEN) });
+
+  send(s.host, {
+    type: 'presence',
+    partnerOnline: !!(s.guest && s.guest.readyState === s.guest.OPEN)
+  });
+
+  send(s.guest, {
+    type: 'presence',
+    partnerOnline: !!(s.host && s.host.readyState === s.host.OPEN)
+  });
 }
 
-// --- translation proxy helpers -------------------------------------------------
-
 const LANG_NAMES = {
-  fa: 'Persian (Farsi)', ar: 'Arabic', en: 'English', tr: 'Turkish', fr: 'French',
-  de: 'German', es: 'Spanish', it: 'Italian', ru: 'Russian', ja: 'Japanese',
-  ko: 'Korean', hi: 'Hindi', ur: 'Urdu', pt: 'Portuguese', nl: 'Dutch',
-  sv: 'Swedish', pl: 'Polish', uk: 'Ukrainian', id: 'Indonesian', vi: 'Vietnamese',
-  th: 'Thai', he: 'Hebrew', el: 'Greek', ro: 'Romanian', bn: 'Bengali', ms: 'Malay',
+  fa: 'Persian (Farsi)',
+  ar: 'Arabic',
+  en: 'English',
+  tr: 'Turkish',
+  fr: 'French',
+  de: 'German',
+  es: 'Spanish',
+  it: 'Italian',
+  ru: 'Russian',
+  ja: 'Japanese',
+  ko: 'Korean',
+  hi: 'Hindi',
+  ur: 'Urdu',
+  pt: 'Portuguese',
+  nl: 'Dutch',
+  sv: 'Swedish',
+  pl: 'Polish',
+  uk: 'Ukrainian',
+  id: 'Indonesian',
+  vi: 'Vietnamese',
+  th: 'Thai',
+  he: 'Hebrew',
+  el: 'Greek',
+  ro: 'Romanian',
+  bn: 'Bengali',
+  ms: 'Malay'
 };
+
 function langName(code) {
-  // 'auto' isn't a real language — it's sent when we're translating text whose
-  // source language isn't already known (photographed text, in practice: the
-  // person's own selected chat language tells us nothing about what language is
-  // printed on a sign/menu/document they photographed). Claude doesn't need — and
-  // can't use — a language *code* for that; it just needs to be told to work out
-  // the source language itself from the text, which it's genuinely good at.
-  if (code === 'auto') return 'the source language (identify it automatically from the text itself — it may be any language)';
+  if (code === 'auto') {
+    return 'the source language (identify it automatically from the text itself — it may be any language)';
+  }
   return LANG_NAMES[code] || code;
 }
 
-async function translateWithClaude(text, fromCode, toCode) {
-  if (!ANTHROPIC_API_KEY) throw new Error('no-anthropic-key');
+function protectFigureTokens(text) {
+  const tokens = [];
+  const protectedText = String(text).replace(
+    /(?<![\p{L}\p{N}])(?:\d+(?:[.,:/-]\d+)*)/gu,
+    (match) => {
+      const i = tokens.length;
+      tokens.push(match);
+      return `__FIGURE_${i}__`;
+    }
+  );
+  return { text: protectedText, tokens };
+}
+
+function restoreFigureTokens(text, tokens) {
+  let out = String(text);
+  tokens.forEach((value, i) => {
+    out = out.replace(new RegExp(`__FIGURE_${i}__`, 'g'), value);
+  });
+  return out;
+}
+
+async function translateWithClaude(text, fromCode, toCode, context = []) {
+  if (!ANTHROPIC_API_KEY) {
+    throw new Error('no-anthropic-key');
+  }
+
   const fromName = langName(fromCode);
   const toName = langName(toCode);
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: 500,
-      system: 'You are the translation engine inside a live speech-translation app used for real spoken conversation. ' +
-        'Translate the user\'s message from ' + fromName + ' to ' + toName + '. ' +
-        'Preserve tone, register, and meaning naturally, the way a skilled fluent bilingual interpreter would speak it out ' +
-        'loud — not a stiff, literal, word-for-word rendering. Favor the phrasing a native speaker would actually say in ' +
-        'this situation: natural word order, idiomatic expressions, and everyday grammar for that language, over a ' +
-        'construction that just mirrors the source sentence structure. Keep it smooth, clear, and polished, but stay ' +
-        'faithful to what was actually said — don\'t add information, soften/harden the tone, or change the meaning. ' +
-        'This same engine is also used to translate this app\'s own short interface text (button labels, toggle captions, ' +
-        'status hints) — not just spoken conversation. If the input is clearly a short UI label or button/action text ' +
-        '(a single word or brief phrase, not a full spoken sentence — things like "Close", "Cancel", "Confirm", "Retry", ' +
-        '"Listening..."), translate it into the standard, idiomatic wording that app in that language actually uses for ' +
-        'that control — the normal imperative/label convention of that language\'s software, never a literal or spoken-out ' +
-        'paraphrase (a "Close" button must read as that language\'s normal button word for closing something, not as an ' +
-        'infinitive phrase like "to close" or a full sentence about closing it). ' +
-        'Never translate or alter numerals written as figures (e.g. "1", "2024", "۱۲", "50%"), dates, prices, codes, or ' +
-        'standalone symbols — copy those through exactly as they appear in the source text. This does NOT apply to ' +
-        'spelled-out number words ("one", "two", "یک", "دو", "first", "اول") — those are ordinary vocabulary and must be ' +
-        'translated like any other word, into the equivalent number word in the target language. Only translate the ' +
-        'surrounding words around a figure, never the figure itself. ' +
-        'Reply with ONLY the translated text — no quotation marks, no notes, no alternate options, no explanations.',
-      messages: [{ role: 'user', content: text }],
-    }),
-  });
+
+  const safeContext = Array.isArray(context)
+    ? context.slice(-6).map((item) => ({
+        source: String(item && item.source || '').slice(0, 500),
+        translated: String(item && item.translated || '').slice(0, 500),
+        sourceLang: String(item && item.sourceLang || '').slice(0, 40),
+        targetLang: String(item && item.targetLang || '').slice(0, 40)
+      })).filter((item) => item.source || item.translated)
+    : [];
+
+  const contextText = safeContext.length
+    ? '\n<conversation_context>\n' +
+      safeContext.map((item, i) =>
+        `[${i + 1}] ${item.sourceLang} → ${item.targetLang}\n` +
+        `source: ${item.source}\n` +
+        `translation: ${item.translated}`
+      ).join('\n') +
+      '\n</conversation_context>\n'
+    : '';
+
+  const protectedInput = protectFigureTokens(text);
+
+  const userContent =
+    contextText +
+    '<current_message>\n' +
+    protectedInput.text +
+    '\n</current_message>';
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 11000);
+
+  let resp;
+
+  try {
+    resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: 500,
+        system:
+          'You are a professional simultaneous interpreter inside a live speech-translation app. ' +
+          `Translate exactly one current spoken/typed message from ${fromName} to ${toName}. ` +
+          'Use natural, idiomatic, immediately speakable conversation — never stiff word-for-word translation. ' +
+          'Preserve meaning, intent, tone, politeness, urgency, certainty, humor, and register. ' +
+          'Use context only to resolve references, pronouns, terminology, or ambiguity. ' +
+          'Never copy old messages into the answer. Never invent facts. Never summarize. ' +
+          'Preserve names, dates, prices, codes, URLs, and figure numbers exactly. ' +
+          'Tokens such as __FIGURE_0__ are protected source figures and MUST remain exactly unchanged. ' +
+          'Spelled-out number words such as one, two, یک, دو, سه are ordinary words and must be translated. ' +
+          'If source is auto, identify the language from the current message itself. ' +
+          'Reply with ONLY the translated text — no quotes, explanations, labels, markdown, or alternatives.',
+        messages: [
+          {
+            role: 'user',
+            content: userContent
+          }
+        ]
+      })
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
-    throw new Error('claude-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
+    throw new Error(
+      'claude-http-' +
+      resp.status +
+      (body ? ': ' + body.slice(0, 250) : '')
+    );
   }
+
   const data = await resp.json();
-  const block = data && data.content && data.content.find((b) => b.type === 'text');
-  const translated = block && block.text && block.text.trim();
-  if (!translated) throw new Error('claude-bad-response');
+  const block = data &&
+    data.content &&
+    data.content.find((b) => b.type === 'text');
+
+  let translated = block &&
+    block.text &&
+    block.text.trim();
+
+  if (!translated) {
+    throw new Error('claude-bad-response');
+  }
+
+  translated = restoreFigureTokens(translated, protectedInput.tokens);
+
+  console.log(
+    `[translate] Claude OK model=${CLAUDE_MODEL}`
+  );
+
   return translated;
 }
 
-// Line-by-line translation for the camera-overlay feature (Google Lens style):
-// each detected OCR line needs its own translated string, in the same order, so
-// the client can redraw each one back on top of the exact spot on the photo where
-// the original line was. Still done as ONE Claude call (not one call per line) so
-// the model can use the whole passage as context and stay natural/coherent —
-// only the *output* is split back into per-line pieces.
 async function translateLinesWithClaude(lines, fromCode, toCode) {
-  if (!ANTHROPIC_API_KEY) throw new Error('no-anthropic-key');
+  if (!ANTHROPIC_API_KEY) {
+    throw new Error('no-anthropic-key');
+  }
+
   const fromName = langName(fromCode);
   const toName = langName(toCode);
-  const numbered = lines.map((l, i) => (i + 1) + '. ' + String(l).replace(/\s+/g, ' ').trim()).join('\n');
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: CLAUDE_MODEL,
-      max_tokens: Math.min(4000, Math.max(500, lines.length * 150)),
-      system: 'You are the translation engine behind a live camera-overlay translation feature (like Google Lens), ' +
-        'translating text that was detected on a photographed image, from ' + fromName + ' to ' + toName + '. ' +
-        'You will receive a numbered list. Each number is already a merged block of nearby on-image text that has been ' +
-        'grouped together because it likely forms one running sentence/paragraph/caption — NOT an arbitrary single OCR ' +
-        'line — so treat each numbered entry as a real chunk of prose to translate as a whole, not as an isolated word ' +
-        'or fragment to be guessed at out of context. Read all the entries together so terminology, tone, and any ' +
-        'pronoun/reference that continues from one entry to the next stay consistent — but you MUST reply with a ' +
-        'translation for EVERY numbered entry, in the exact same order and exact same count as the input, one output ' +
-        'entry per input entry. Never merge two input entries into one output entry or split one input entry into two. ' +
-        'If an entry is just a stray character, a number, a logo fragment, or otherwise not real translatable text, ' +
-        'still return an entry for it (repeat it as-is or return an empty string), so the count always matches. ' +
-        'Translate each entry the way a skilled bilingual native speaker would naturally phrase it — smooth, idiomatic, ' +
-        'full-sentence phrasing in the target language, never a stiff word-for-word rendering, and never a fragment ' +
-        'that only makes sense chained to a neighboring entry. Watch for words that are ambiguous in isolation but not ' +
-        'in context (e.g. a verb that can mean either "want/like to" or "love", depending on what follows it) — use the ' +
-        'surrounding entries to pick the sense that actually fits, rather than defaulting to the most literal one. ' +
-        'Never translate or alter numerals written as figures (e.g. "1", "2024", "۱۲", "01", "2/4"), dates, prices, codes, ' +
-        'or standalone symbols/logos — copy those through exactly as they appear in the source text. This does NOT apply ' +
-        'to spelled-out number words ("one", "two", "یک", "دو", "سه") — those are ordinary vocabulary and must be ' +
-        'translated like any other word, into the equivalent number word in the target language. Only translate the ' +
-        'surrounding words around a figure, never the figure itself. Each translated entry gets redrawn as one block covering the merged area its source text occupied ' +
-        'on the photo, so it does NOT need to match the original\'s length line-for-line — prioritize a natural, correctly ' +
-        'worded sentence over matching length. Reply with ONLY a raw JSON array of strings — no markdown, no code ' +
-        'fence, no commentary — with exactly ' + lines.length + ' items in order.',
-      messages: [{ role: 'user', content: numbered }],
-    }),
-  });
+
+  const numbered = lines.map((line, i) =>
+    `${i + 1}. ${String(line).replace(/\s+/g, ' ').trim()}`
+  ).join('\n');
+
+  const resp = await fetch(
+    'https://api.anthropic.com/v1/messages',
+    {
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: Math.min(
+          4000,
+          Math.max(500, lines.length * 150)
+        ),
+        system:
+          'You are the translation engine behind a live camera-overlay translation feature. ' +
+          `Translate the numbered entries from ${fromName} to ${toName}. ` +
+          'Return exactly the same number of entries in exactly the same order. ' +
+          'Each entry is a real text block from the image and should be translated naturally. ' +
+          'Do not merge or split entries. ' +
+          'Standalone numbers, dates, prices, codes and symbols must remain unchanged. ' +
+          'Spelled-out number words must be translated. ' +
+          'If an entry is not meaningful text, repeat it or return an empty string. ' +
+          'Reply ONLY with a raw JSON array of strings.',
+        messages: [
+          {
+            role: 'user',
+            content: numbered
+          }
+        ]
+      })
+    }
+  );
+
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
-    throw new Error('claude-lines-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
+    throw new Error(
+      'claude-lines-http-' +
+      resp.status +
+      (body ? ': ' + body.slice(0, 250) : '')
+    );
   }
+
   const data = await resp.json();
-  const block = data && data.content && data.content.find((b) => b.type === 'text');
-  let raw = block && block.text && block.text.trim();
-  if (!raw) throw new Error('claude-lines-bad-response');
-  raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  const block = data &&
+    data.content &&
+    data.content.find((b) => b.type === 'text');
+
+  let raw = block &&
+    block.text &&
+    block.text.trim();
+
+  if (!raw) {
+    throw new Error('claude-lines-bad-response');
+  }
+
+  raw = raw
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/, '')
+    .trim();
+
   let arr;
+
   try {
     arr = JSON.parse(raw);
   } catch (e) {
     throw new Error('claude-lines-unparsable');
   }
-  if (!Array.isArray(arr) || arr.length !== lines.length) throw new Error('claude-lines-count-mismatch');
-  return arr.map((s) => (s == null ? '' : String(s).trim()));
-}
 
-// Fallback if the batched Claude call fails or a non-Claude engine is active:
-// translate each line on its own through the normal single-text chain (slower,
-// loses cross-line context, but still produces a correct per-line result).
-async function translateLinesSequentially(lines, fromCode, toCode) {
-  const out = [];
-  let engine = null;
-  for (const line of lines) {
-    const trimmed = String(line).trim();
-    if (!trimmed) { out.push(''); continue; }
-    const r = await translateText(trimmed, fromCode, toCode);
-    out.push(r.translated);
-    engine = engine || r.engine;
+  if (!Array.isArray(arr) || arr.length !== lines.length) {
+    throw new Error('claude-lines-count-mismatch');
   }
-  return { translated: out, engine: (engine || 'unknown') + '-per-line' };
-}
 
-async function translateLines(lines, fromCode, toCode) {
-  try {
-    const translated = await translateLinesWithClaude(lines, fromCode, toCode);
-    return { translated, engine: 'claude-lines' };
-  } catch (claudeErr) {
-    try {
-      return await translateLinesSequentially(lines, fromCode, toCode);
-    } catch (fallbackErr) {
-      throw new Error('line translation failed — claude: ' + claudeErr.message + ' | fallback: ' + fallbackErr.message);
-    }
-  }
-}
-
-async function translateWithWorkersAI(text, fromCode, toCode) {
-  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) throw new Error('no-workers-ai-credentials');
-  // Cloudflare's translation model needs an actual source language code, not
-  // 'auto' — skip straight to the next engine in the chain rather than sending it
-  // something it can't use.
-  if (fromCode === 'auto') throw new Error('workers-ai-no-auto-detect-support');
-  const resp = await fetch(
-    'https://api.cloudflare.com/client/v4/accounts/' + CF_ACCOUNT_ID + '/ai/run/' + CF_TRANSLATE_MODEL,
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + CF_API_TOKEN,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ text, source_lang: fromCode, target_lang: toCode }),
-    }
+  console.log(
+    `[translate-lines] Claude OK model=${CLAUDE_MODEL} count=${lines.length}`
   );
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    throw new Error('workers-ai-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
-  }
-  const data = await resp.json();
-  if (!data || data.success === false) {
-    const apiErr = data && data.errors && data.errors[0] && data.errors[0].message;
-    throw new Error('workers-ai-api-error' + (apiErr ? ': ' + apiErr : ''));
-  }
-  const translated = data && data.result && data.result.translated_text;
-  if (!translated) throw new Error('workers-ai-bad-response');
-  return translated;
-}
 
-async function transcribeWithWorkersAI(base64Audio, languageHint) {
-  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) throw new Error('no-workers-ai-credentials');
-  const payload = { audio: base64Audio };
-  // languageHint is one of our own two-letter LANGS codes (fa, ar, en, ...), which
-  // are already valid ISO 639-1 codes — no mapping needed. Omitted entirely if not
-  // given, in which case Whisper auto-detects the spoken language itself.
-  if (languageHint) payload.language = languageHint;
-  const resp = await fetch(
-    'https://api.cloudflare.com/client/v4/accounts/' + CF_ACCOUNT_ID + '/ai/run/' + CF_WHISPER_MODEL,
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + CF_API_TOKEN,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload),
-    }
+  return arr.map((s) =>
+    s == null ? '' : String(s).trim()
   );
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    throw new Error('workers-ai-whisper-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
-  }
-  const data = await resp.json();
-  if (!data || data.success === false) {
-    const apiErr = data && data.errors && data.errors[0] && data.errors[0].message;
-    throw new Error('workers-ai-whisper-api-error' + (apiErr ? ': ' + apiErr : ''));
-  }
-  const text = data && data.result && data.result.text;
-  if (typeof text !== 'string') throw new Error('workers-ai-whisper-bad-response');
-  return text.trim();
-}
-
-function toDeepLTarget(code) {
-  if (code === 'en') return 'EN-US';
-  return code.toUpperCase();
-}
-function toDeepLSource(code) {
-  return code.toUpperCase();
-}
-
-async function translateWithDeepL(text, fromCode, toCode) {
-  if (!DEEPL_API_KEY) throw new Error('no-deepl-key');
-  const body = { text: [text], target_lang: toDeepLTarget(toCode) };
-  // DeepL auto-detects the source language when source_lang is left out of the
-  // request entirely — there's no 'AUTO' value it accepts for that field.
-  if (fromCode !== 'auto') body.source_lang = toDeepLSource(fromCode);
-  const resp = await fetch(DEEPL_BASE + '/v2/translate', {
-    method: 'POST',
-    headers: {
-      'Authorization': 'DeepL-Auth-Key ' + DEEPL_API_KEY,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => '');
-    throw new Error('deepl-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
-  }
-  const data = await resp.json();
-  const translated = data && data.translations && data.translations[0] && data.translations[0].text;
-  if (!translated) throw new Error('deepl-bad-response');
-  return translated;
-}
-
-// Free, no-key Google Translate — the actual "Google Translate" quality people
-// expect, via the same reverse-engineered endpoint every free translation tool has
-// used for years (translate_a/single, NOT the paid Cloud Translation API). Response
-// is a deeply nested JSON array; translated text is the concatenation of
-// data[0][i][0] for each sentence chunk Google split the input into.
-async function translateWithGoogle(text, fromCode, toCode) {
-  const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl='
-    + encodeURIComponent(fromCode) + '&tl=' + encodeURIComponent(toCode) + '&dt=t&q=' + encodeURIComponent(text);
-  const resp = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' },
-  });
-  if (!resp.ok) throw new Error('google-translate-http-' + resp.status);
-  const data = await resp.json();
-  const sentences = data && data[0];
-  if (!Array.isArray(sentences) || !sentences.length) throw new Error('google-translate-bad-response');
-  const translated = sentences.map((s) => (s && s[0]) || '').join('').trim();
-  if (!translated) throw new Error('google-translate-empty');
-  return translated;
-}
-
-async function translateWithLibreTranslate(text, fromCode, toCode) {
-  const url = 'https://translate.terraprint.co/translate';
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
+        }
+  const started = Date.now();
   try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q: text, source: fromCode, target: toCode, format: 'text' }),
-      signal: controller.signal,
-    });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => '');
-      throw new Error('libretranslate-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
-    }
-    const data = await resp.json();
-    if (data && typeof data.translatedText === 'string') {
-      return data.translatedText;
-    }
-    throw new Error('libretranslate-bad-response');
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function translateText(text, fromCode, toCode) {
-  try {
-    const translated = await translateWithClaude(text, fromCode, toCode);
+    const translated = await translateWithClaude(text, fromCode, toCode, context);
+    console.log('[translate] Claude OK model=' + CLAUDE_MODEL + ' ms=' + (Date.now() - started));
     return { translated, engine: 'claude' };
   } catch (claudeErr) {
+    console.error('[translate] Claude FAILED model=' + CLAUDE_MODEL + ' error=' + claudeErr.message);
     try {
       const translated = await translateWithWorkersAI(text, fromCode, toCode);
       return { translated, engine: 'workers-ai-fallback', claudeError: claudeErr.message };
@@ -444,15 +342,6 @@ async function translateText(text, fromCode, toCode) {
     }
   }
 }
-
-// --- server-side TTS (POST /tts) --------------------------------------------
-
-// ElevenLabs — tried first when configured (best quality of the three engines
-// here). Needs just an API key from elevenlabs.io → Profile → API Keys.
-// ELEVENLABS_VOICE_ID is optional; defaults to "Rachel", one of ElevenLabs'
-// stock voices available on every account. eleven_multilingual_v2 auto-detects
-// the spoken language from the text itself, so no per-language voice map is
-// needed the way Edge TTS requires one.
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
 async function synthesizeElevenLabsTts(text) {
@@ -475,7 +364,6 @@ async function synthesizeElevenLabsTts(text) {
   }
   return Buffer.from(await resp.arrayBuffer());
 }
-
 const EDGE_TTS_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 const EDGE_VOICES = {
   'fa-IR':'fa-IR-DilaraNeural', 'ar-SA':'ar-SA-ZariyahNeural', 'en-US':'en-US-AriaNeural',
@@ -504,7 +392,6 @@ function edgeSecMsGec() {
 function escapeXml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
-
 function synthesizeEdgeTts(text, bcp) {
   return new Promise((resolve, reject) => {
     const voice = EDGE_VOICES[bcp] || EDGE_VOICES['en-US'];
@@ -547,7 +434,6 @@ function synthesizeEdgeTts(text, bcp) {
     });
   });
 }
-
 function splitForGoogleTts(text, maxLen) {
   const parts = [];
   let remaining = text.trim();
@@ -575,7 +461,6 @@ async function synthesizeGoogleTts(text, langCode2) {
   if (!buffers.length) throw new Error('google-tts-empty');
   return Buffer.concat(buffers);
 }
-
 function readJsonBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -592,20 +477,15 @@ function readJsonBody(req, maxBytes) {
     req.on('error', reject);
   });
 }
-
-// --- HTTP server: health check + /translate + /tts proxies ---------------------
-
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
     return;
   }
-
   if (req.method === 'POST' && req.url === '/translate') {
     try {
       const body = await readJsonBody(req, 20000);
@@ -615,8 +495,14 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'text, source و target لازم است' }));
         return;
       }
-      const result = await translateText(String(text), String(source), String(target));
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      const context = Array.isArray(body.context) ? body.context : [];
+      console.log('[translate] request ' + String(source) + ' -> ' + String(target) + ' chars=' + String(text).length + ' context=' + context.length);
+      const result = await translateText(String(text), String(source), String(target), context);
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'X-Translation-Engine': result.engine || 'unknown',
+        'X-Translation-Model': CLAUDE_MODEL,
+      });
       res.end(JSON.stringify(result));
     } catch (err) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -624,7 +510,6 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-
   if (req.method === 'POST' && req.url === '/translate-lines') {
     try {
       const body = await readJsonBody(req, 40000);
@@ -633,7 +518,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'lines (آرایه), source و target لازم است' }));
         return;
-      }
+              }
       if (lines.length > 60) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'تعداد خط‌ها بیش از حد مجاز است' }));
@@ -648,12 +533,8 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-
   if (req.method === 'POST' && req.url === '/transcribe') {
     try {
-      // Base64 audio for a short voice message (recording is capped to 90s
-      // client-side) comfortably fits well under this — the cap just guards
-      // against something huge/broken being posted here.
       const body = await readJsonBody(req, 15 * 1024 * 1024);
       const { audio, language } = body;
       if (!audio) {
@@ -675,7 +556,6 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-
   if (req.method === 'POST' && req.url === '/tts') {
     try {
       const body = await readJsonBody(req, 5000);
@@ -710,10 +590,9 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   const status = [
-    ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured',
+    (ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured') + ' (' + CLAUDE_MODEL + ')',
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI configured' : 'Workers AI NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
     'Google Translate + LibreTranslate fallbacks always available (no key needed)',
@@ -723,17 +602,13 @@ const server = http.createServer(async (req, res) => {
   ].join(', ');
   res.end('translation relay server is running (' + status + ')');
 });
-
 const wss = new WebSocketServer({ server });
-
 wss.on('connection', (ws) => {
   ws.role = null;
   ws.code = null;
-
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
-
     if (msg.type === 'create') {
       const code = makeCode();
       sessions.set(code, { host: ws, guest: null, hostLang: msg.lang, guestLang: null });
@@ -742,7 +617,6 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'created', code });
       return;
     }
-
     if (msg.type === 'join') {
       const s = sessions.get(msg.code);
       if (!s) { send(ws, { type: 'error', message: 'جلسه‌ای با این کد پیدا نشد' }); return; }
@@ -755,13 +629,7 @@ wss.on('connection', (ws) => {
       broadcastPresence(msg.code);
       return;
     }
-
     if (msg.type === 'rejoin') {
-      // A phone whose socket dropped (screen lock, backgrounding, a brief network
-      // blip, the mobile browser suspending the tab) reconnects and asks to resume
-      // its old seat. This only works because the session itself is never deleted
-      // just for a socket closing — see ws.on('close') below — so it's still here
-      // to resume into.
       const s = sessions.get(msg.code);
       if (!s) { send(ws, { type: 'error', message: 'جلسه‌ای با این کد پیدا نشد' }); return; }
       if (msg.role !== 'host' && msg.role !== 'guest') return;
@@ -770,8 +638,6 @@ wss.on('connection', (ws) => {
       ws.code = msg.code;
       const partnerLang = msg.role === 'host' ? s.guestLang : s.hostLang;
       send(ws, { type: 'rejoined', code: msg.code, partnerLang });
-      // Deliver anything that arrived while this side's socket was down (screen
-      // off, backgrounded, brief network drop) instead of it being lost for good.
       if (s.pending && s.pending.length) {
         const mine = s.pending.filter(p => p.role === msg.role);
         s.pending = s.pending.filter(p => p.role !== msg.role);
@@ -780,18 +646,10 @@ wss.on('connection', (ws) => {
       broadcastPresence(msg.code);
       return;
     }
-
     if (msg.type === 'ping') {
-      // Keepalive from the client — see the matching comment in index.html
-      // (startPairHeartbeat). Replying isn't even the important part; the mere
-      // act of receiving/sending traffic is what stops Render's free-tier proxy
-      // from treating this socket as idle and silently closing it — which is
-      // exactly what used to happen while a host just sat on the "waiting for
-      // guest" screen (e.g. copying/sharing the code) without sending anything.
       send(ws, { type: 'pong' });
       return;
     }
-
     if (msg.type === 'setLang') {
       const s = sessions.get(ws.code);
       if (!s) return;
@@ -800,12 +658,7 @@ wss.on('connection', (ws) => {
       send(otherSide(s, ws.role), { type: 'partnerLangChanged', lang: msg.lang });
       return;
     }
-
     if (msg.type === 'chat') {
-      // fromPhoto marks a message that came from the camera/OCR flow; when it does,
-      // photoPng (a data: URL) carries the already-translated image and
-      // original/translated text are omitted entirely — the photo IS the message,
-      // not a caption alongside it.
       const s = sessions.get(ws.code);
       if (!s) return;
       const target = otherSide(s, ws.role);
@@ -820,12 +673,6 @@ wss.on('connection', (ws) => {
       if (target && target.readyState === target.OPEN) {
         send(target, payload);
       } else {
-        // The partner's socket is down right now (their screen turned off, the
-        // mobile browser suspended their tab, a brief network drop) — don't just
-        // drop this on the floor. Queue it on the session so it's delivered the
-        // moment they reconnect and rejoin (see 'rejoin' above), same as a real
- // messaging app would. Capped so a session nobody ever comes back to
-        // doesn't grow unbounded in memory.
         const targetRole = ws.role === 'host' ? 'guest' : 'host';
         s.pending = s.pending || [];
         s.pending.push({ role: targetRole, payload });
@@ -833,24 +680,12 @@ wss.on('connection', (ws) => {
       }
       return;
     }
-
     if (msg.type === 'leave') {
-      // Explicit, intentional "end call" — the ONLY thing that expires a code.
-      // A dropped socket (screen off, app-switch, tab suspended in background)
-      // never reaches here; it only hits ws.on('close') below, which does not
-      // delete the session. This is what lets the other phone keep chatting (or
-      // rejoin) even if you briefly left the page to copy/share the code.
       endSession(ws.code, ws.role);
       return;
     }
   });
-
   ws.on('close', () => {
-    // Just a dropped socket — NOT an intentional end. Mark this side offline so
-    // the partner's presence dot updates, but keep the session alive in memory
-    // indefinitely so either side can send {type:'rejoin'} and resume. The code
-    // only stops working once someone explicitly sends {type:'leave'} (i.e.
-    // taps "end call" / "leave session").
     if (!ws.code) return;
     const s = sessions.get(ws.code);
     if (!s) return;
@@ -859,7 +694,6 @@ wss.on('connection', (ws) => {
     broadcastPresence(ws.code);
   });
 });
-
 function endSession(code, byRole) {
   const s = sessions.get(code);
   if (!s) return;
@@ -867,10 +701,9 @@ function endSession(code, byRole) {
   send(partner, { type: 'sessionEnded' });
   sessions.delete(code);
 }
-
 server.listen(PORT, () => {
   const status = [
-    ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured',
+    (ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured') + ' (' + CLAUDE_MODEL + ')',
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI configured' : 'Workers AI NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
     ELEVENLABS_API_KEY ? 'ElevenLabs TTS configured' : 'ElevenLabs TTS NOT configured',
