@@ -590,7 +590,6 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   const status = [
     (ANTHROPIC_API_KEY ? 'Claude configured' : 'Claude NOT configured') + ' (' + CLAUDE_MODEL + ')',
