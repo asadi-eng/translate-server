@@ -878,14 +878,18 @@ async function translateWithLibreTranslate(text, fromCode, toCode) {
     clearTimeout(timer);
   }
 }
-async function translateText(text, fromCode, toCode, context = [], userId = null, dialectHints = {}) {
+// Names a person can pick in Settings -> "کدام هوش مصنوعی ترجمه کند؟". Anything
+// else (missing, 'auto', or an unrecognized value) falls back to the normal
+// best-first chain below with no reordering.
+const SELECTABLE_ENGINES = ['groq', 'gemini', 'workers-ai-llm', 'claude', 'workers-ai-fallback', 'deepl-fallback', 'google-fallback', 'libretranslate-fallback'];
+async function translateText(text, fromCode, toCode, context = [], userId = null, dialectHints = {}, preferredEngine = null) {
   const started = Date.now();
   const errors = {};
   const corrections = getCorrectionsFor(userId, toCode);
   // Order = best free (no credit card) quality first, most limited/oldest engines
   // last. Any engine whose API key/credentials aren't configured just throws
   // immediately (e.g. 'no-groq-key') and the chain moves on with no delay.
-  const engines = [
+  let engines = [
     { name: 'groq', model: GROQ_MODEL, run: () => translateWithGroq(text, fromCode, toCode, context, dialectHints, corrections) },
     { name: 'gemini', model: GEMINI_MODEL, run: () => translateWithGemini(text, fromCode, toCode, context, dialectHints, corrections) },
     { name: 'workers-ai-llm', run: () => translateWithLLMChain(text, fromCode, toCode, context, userId, dialectHints) },
@@ -895,6 +899,15 @@ async function translateText(text, fromCode, toCode, context = [], userId = null
     { name: 'google-fallback', model: 'google-translate', run: () => translateWithGoogle(text, fromCode, toCode) },
     { name: 'libretranslate-fallback', model: 'libretranslate', run: () => translateWithLibreTranslate(text, fromCode, toCode) },
   ];
+  // The person chose a specific engine in Settings instead of "auto" — try that
+  // one first, then still fall through to the rest of the chain on failure so a
+  // translation still comes back rather than a hard error.
+  if (preferredEngine && SELECTABLE_ENGINES.includes(preferredEngine)) {
+    const picked = engines.find((e) => e.name === preferredEngine);
+    if (picked) {
+      engines = [picked, ...engines.filter((e) => e.name !== preferredEngine)];
+    }
+  }
   for (const engine of engines) {
     try {
       const result = await engine.run();
@@ -967,7 +980,7 @@ function pickEdgeVoice(bcp, gender) {
   return (gender === 'male' && pair.male) ? pair.male : pair.female;
 }
 function uuidNoDashes() {
-  return 'xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+return 'xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0, v = c === 'x' ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
@@ -1091,7 +1104,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/translate') {
     try {
       const body = await readJsonBody(req, 20000);
-      const { text, source, target, userId, dialectFrom, dialectTo } = body;
+      const { text, source, target, userId, dialectFrom, dialectTo, engine } = body;
       if (!text || !source || !target) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'text, source و target لازم است' }));
@@ -1100,8 +1113,9 @@ const server = http.createServer(async (req, res) => {
       const context = Array.isArray(body.context) ? body.context : [];
       const safeUserId = userId ? String(userId).slice(0, 80) : null;
       const dialectHints = { from: dialectFrom ? String(dialectFrom) : '', to: dialectTo ? String(dialectTo) : '' };
-      console.log('[translate] request ' + String(source) + ' -> ' + String(target) + ' chars=' + String(text).length + ' context=' + context.length);
-      const result = await translateText(String(text), String(source), String(target), context, safeUserId, dialectHints);
+      const preferredEngine = engine ? String(engine) : null;
+      console.log('[translate] request ' + String(source) + ' -> ' + String(target) + ' chars=' + String(text).length + ' context=' + context.length + (preferredEngine ? ' preferredEngine=' + preferredEngine : ''));
+      const result = await translateText(String(text), String(source), String(target), context, safeUserId, dialectHints, preferredEngine);
       res.writeHead(200, {
         'Content-Type': 'application/json',
         'X-Translation-Engine': result.engine || 'unknown',
@@ -1357,6 +1371,7 @@ wss.on('connection', (ws) => {
         model: msg.model || null,
         targetLang: msg.targetLang || null,
         gender: msg.gender || null,
+        msgId: msg.msgId || null,
       };
       if (target && target.readyState === target.OPEN) {
         send(target, payload);
@@ -1365,6 +1380,18 @@ wss.on('connection', (ws) => {
         s.pending = s.pending || [];
         s.pending.push({ role: targetRole, payload });
         if (s.pending.length > 200) s.pending.shift();
+      }
+      return;
+    }
+    // Read receipts: relay a delivered/seen ack for a given msgId straight back
+    // to whichever side originally sent that message — same "other side of this
+    // session" lookup as 'chat' above, just no payload beyond the ack itself.
+    if (msg.type === 'delivered' || msg.type === 'seen') {
+      const s = sessions.get(ws.code);
+      if (!s || !msg.msgId) return;
+      const target = otherSide(s, ws.role);
+      if (target && target.readyState === target.OPEN) {
+        send(target, { type: msg.type, msgId: String(msg.msgId) });
       }
       return;
     }
@@ -1402,29 +1429,16 @@ server.listen(PORT, () => {
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 }); 
 
-
-
   
 
 
 
 
 
-
-
-  
-
+        
 
 
 
-
-
-
-
-
-
-
-      
 
 
 
