@@ -874,16 +874,37 @@ async function synthesizeElevenLabsTts(text) {
 }
 const EDGE_TTS_TOKEN = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
 const EDGE_VOICES = {
-  'fa-IR':'fa-IR-DilaraNeural', 'ar-SA':'ar-SA-ZariyahNeural', 'en-US':'en-US-AriaNeural',
-  'tr-TR':'tr-TR-EmelNeural', 'fr-FR':'fr-FR-DeniseNeural', 'de-DE':'de-DE-KatjaNeural',
-  'es-ES':'es-ES-ElviraNeural', 'it-IT':'it-IT-ElsaNeural', 'ru-RU':'ru-RU-SvetlanaNeural',
-  'ja-JP':'ja-JP-NanamiNeural', 'ko-KR':'ko-KR-SunHiNeural', 'hi-IN':'hi-IN-SwaraNeural',
-  'ur-PK':'ur-PK-UzmaNeural', 'pt-PT':'pt-PT-RaquelNeural', 'nl-NL':'nl-NL-ColetteNeural',
-  'sv-SE':'sv-SE-SofieNeural', 'pl-PL':'pl-PL-ZofiaNeural', 'uk-UA':'uk-UA-PolinaNeural',
-  'id-ID':'id-ID-GadisNeural', 'vi-VN':'vi-VN-HoaiMyNeural', 'th-TH':'th-TH-PremwadeeNeural',
-  'he-IL':'he-IL-HilaNeural', 'el-GR':'el-GR-AthinaNeural', 'ro-RO':'ro-RO-AlinaNeural',
-  'bn-BD':'bn-BD-NabanitaNeural', 'ms-MY':'ms-MY-YasminNeural',
+  'fa-IR':{female:'fa-IR-DilaraNeural', male:'fa-IR-FaridNeural'},
+  'ar-SA':{female:'ar-SA-ZariyahNeural', male:'ar-SA-HamedNeural'},
+  'en-US':{female:'en-US-AriaNeural', male:'en-US-GuyNeural'},
+  'tr-TR':{female:'tr-TR-EmelNeural', male:'tr-TR-AhmetNeural'},
+  'fr-FR':{female:'fr-FR-DeniseNeural', male:'fr-FR-HenriNeural'},
+  'de-DE':{female:'de-DE-KatjaNeural', male:'de-DE-ConradNeural'},
+  'es-ES':{female:'es-ES-ElviraNeural', male:'es-ES-AlvaroNeural'},
+  'it-IT':{female:'it-IT-ElsaNeural', male:'it-IT-DiegoNeural'},
+  'ru-RU':{female:'ru-RU-SvetlanaNeural', male:'ru-RU-DmitryNeural'},
+  'ja-JP':{female:'ja-JP-NanamiNeural', male:'ja-JP-KeitaNeural'},
+  'ko-KR':{female:'ko-KR-SunHiNeural', male:'ko-KR-InJoonNeural'},
+  'hi-IN':{female:'hi-IN-SwaraNeural', male:'hi-IN-MadhurNeural'},
+  'ur-PK':{female:'ur-PK-UzmaNeural', male:'ur-PK-AsadNeural'},
+  'pt-PT':{female:'pt-PT-RaquelNeural', male:'pt-PT-DuarteNeural'},
+  'nl-NL':{female:'nl-NL-ColetteNeural', male:'nl-NL-MaartenNeural'},
+  'sv-SE':{female:'sv-SE-SofieNeural', male:'sv-SE-MattiasNeural'},
+  'pl-PL':{female:'pl-PL-ZofiaNeural', male:'pl-PL-MarekNeural'},
+  'uk-UA':{female:'uk-UA-PolinaNeural', male:'uk-UA-OstapNeural'},
+  'id-ID':{female:'id-ID-GadisNeural', male:'id-ID-ArdiNeural'},
+  'vi-VN':{female:'vi-VN-HoaiMyNeural', male:'vi-VN-NamMinhNeural'},
+  'th-TH':{female:'th-TH-PremwadeeNeural', male:'th-TH-NiwatNeural'},
+  'he-IL':{female:'he-IL-HilaNeural', male:'he-IL-AvriNeural'},
+  'el-GR':{female:'el-GR-AthinaNeural', male:'el-GR-NestorasNeural'},
+  'ro-RO':{female:'ro-RO-AlinaNeural', male:'ro-RO-EmilNeural'},
+  'bn-BD':{female:'bn-BD-NabanitaNeural', male:'bn-BD-PradeepNeural'},
+  'ms-MY':{female:'ms-MY-YasminNeural', male:'ms-MY-OsmanNeural'},
 };
+function pickEdgeVoice(bcp, gender) {
+  const pair = EDGE_VOICES[bcp] || EDGE_VOICES['en-US'];
+  return (gender === 'male' && pair.male) ? pair.male : pair.female;
+}
 function uuidNoDashes() {
   return 'xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0, v = c === 'x' ? r : (r & 0x3) | 0x8;
@@ -900,13 +921,13 @@ function edgeSecMsGec() {
 function escapeXml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
-function synthesizeEdgeTts(text, bcp) {
+const EDGE_CLIENT_VERSION = '1-143.0.3650.75';
+function synthesizeEdgeTts(text, bcp, gender) {
   return new Promise((resolve, reject) => {
-    const voice = EDGE_VOICES[bcp] || EDGE_VOICES['en-US'];
+    const voice = pickEdgeVoice(bcp, gender);
     const gec = edgeSecMsGec();
     const wsUrl = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
-      + '?TrustedClientToken=' + EDGE_TTS_TOKEN + '&Sec-MS-GEC=' + gec + '&Sec-MS-GEC-Version=1-131.0.0.0';
-    let ws;
+      + '?TrustedClientToken=' + EDGE_TTS_TOKEN + '&Sec-MS-GEC=' + gec + '&Sec-MS-GEC-Version=' + EDGE_CLIENT_VERSION;    let ws;
     try { ws = new WebSocket(wsUrl); } catch (e) { reject(e); return; }
     const audioParts = [];
     let settled = false;
@@ -1141,7 +1162,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url === '/tts') {
     try {
       const body = await readJsonBody(req, 5000);
-      const { text, bcp } = body;
+      const { text, bcp, gender } = body;
       if (!text || !bcp) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'text و bcp لازم است' }));
@@ -1153,7 +1174,7 @@ const server = http.createServer(async (req, res) => {
         engine = 'elevenlabs';
       } catch (elevenErr) {
         try {
-          audio = await synthesizeEdgeTts(String(text), String(bcp));
+          audio = await synthesizeEdgeTts(String(text), String(bcp), gender);
           engine = 'edge';
         } catch (edgeErr) {
           try {
