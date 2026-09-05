@@ -7,6 +7,17 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
+// Groq (console.groq.com) — free tier, no credit card required to sign up.
+// Hosts much larger open models (Llama 3.3 70B) than Cloudflare's free-tier
+// pool, at very high speed. Optional: if GROQ_API_KEY is unset, translateWithGroq
+// below fails fast with 'no-groq-key' and the chain just moves to the next engine.
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+// Google AI Studio (aistudio.google.com) — also free tier, no credit card.
+// Gemini's multilingual quality is generally strong. Same optional/fail-fast
+// pattern as Groq above if GEMINI_API_KEY is unset.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const DEEPL_API_KEY = process.env.DEEPL_API_KEY || '';
 const DEEPL_BASE = DEEPL_API_KEY.endsWith(':fx')
   ? 'https://api-free.deepl.com'
@@ -61,9 +72,10 @@ const CF_TRANSLATE_MODEL = '@cf/meta/m2m100-1.2b';
 // list is tried automatically before we ever fall back to the literal M2M-100
 // engine. Order = our best-effort default priority, not a proven ranking.
 const LLM_MODEL_POOL = [
-  '@cf/meta/llama-3.1-8b-instruct',            // primary — confirmed free-tier, solid multilingual instruct model
-  '@cf/mistralai/mistral-small-3.1-24b-instruct', // 2nd try — different model family/training data, free-tier
-  '@cf/qwen/qwen2.5-coder-32b-instruct',        // 3rd try — another independent fallback, free-tier
+  '@cf/meta/llama-3.3-70b-instruct-fp8-fast', // primary — much stronger than the 8b model below, still free-tier (uses more of the daily neuron quota per request, so it'll run out sooner on heavy days — that's why the smaller ones stay below it as fallback)
+  '@cf/meta/llama-3.1-8b-instruct',            // 2nd try — confirmed free-tier, solid multilingual instruct model
+  '@cf/mistralai/mistral-small-3.1-24b-instruct', // 3rd try — different model family/training data, free-tier
+  '@cf/qwen/qwen2.5-coder-32b-instruct',        // 4th try — another independent fallback, free-tier
 ];
 // NOTE: glm-4.7-flash and kimi-k2.6 (previously in this pool) now require the
 // Workers AI PAID plan — they return HTTP 403 "not available on the Workers
@@ -310,8 +322,10 @@ function buildCorrectionsBlock(corrections) {
     ).join('\n') +
     '\n</user_preferred_phrasing_examples>\n';
 }
-async function translateWithClaude(text, fromCode, toCode, context = [], dialectHints = {}, corrections = []) {
-  if (!ANTHROPIC_API_KEY) throw new Error('no-anthropic-key');
+// Shared by every single-message translation engine (Claude, Workers AI LLM
+// pool, Groq, Gemini) so the instructions — including the greeting/farewell
+// anti-confusion rule — never drift out of sync between engines.
+function buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections) {
   const fromName = langName(fromCode, dialectHints && dialectHints.from);
   const toName = langName(toCode, dialectHints && dialectHints.to);
   const safeContext = Array.isArray(context) ? context.slice(-6).map((item) => ({
@@ -328,6 +342,31 @@ async function translateWithClaude(text, fromCode, toCode, context = [], dialect
       ).join('\n') + '\n</conversation_context>\n'
     : '';
   const userContent = buildCorrectionsBlock(corrections) + contextText + '<current_message>\n' + String(text) + '\n</current_message>';
+  const systemPrompt = 'You are a professional simultaneous interpreter inside a live speech-translation app. ' +
+    'Translate exactly one current spoken/typed message from ' + fromName + ' to ' + toName + '. ' +
+    'Your goal is natural, idiomatic, immediately speakable conversation — never a stiff word-for-word translation. ' +
+    'Preserve the speaker\'s meaning, intent, tone, politeness, urgency, certainty, humor, and register. ' +
+    'Use the wording a native speaker would naturally say in this real situation. ' +
+    'Use the conversation context only to resolve references, omitted subjects, pronouns, terminology, or ambiguity; ' +
+    'never copy context into the answer and never translate old messages again. ' +
+    'Do not invent facts, add explanations, add politeness that was not present, or make the speaker sound stronger or weaker. ' +
+    'Do not summarize. Keep names, numbers, dates, prices, codes, URLs, and standalone symbols accurate. ' +
+    'For figures written as digits, preserve the digits exactly as written. ' +
+    'For spoken number words, translate them normally. ' +
+    'Never swap a word for its opposite. This applies especially to greetings and farewells: a message that opens with ' +
+    '"hello"/"hi"/"hey" (or the equivalent opening greeting in the source language) must be translated using the ' +
+    'target language\'s own OPENING greeting, never its farewell — for example into Persian that is "سلام", never "خداحافظی". ' +
+    'Likewise "bye"/"goodbye" must become the target language\'s farewell, never its greeting. ' +
+    'Before answering, re-check that the first word of your translation matches the sense (greeting vs. farewell, yes vs. no, etc.) of the first word of the source message. ' +
+    'If source language is "auto", identify the language from the current message itself. ' +
+    'If the current message is short or colloquial, prefer the normal conversational equivalent in the target language. ' +
+    'Reply with ONLY the translated text — no quotes, notes, alternatives, explanations, labels, or markdown. ' +
+    'The <conversation_context> block is reference data only. The <current_message> block is the only text to translate.';
+  return { systemPrompt, userContent };
+}
+async function translateWithClaude(text, fromCode, toCode, context = [], dialectHints = {}, corrections = []) {
+  if (!ANTHROPIC_API_KEY) throw new Error('no-anthropic-key');
+  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 11000);
   let resp;
@@ -342,21 +381,7 @@ async function translateWithClaude(text, fromCode, toCode, context = [], dialect
       body: JSON.stringify({
         model: CLAUDE_MODEL,
         max_tokens: 500,
-        system: 'You are a professional simultaneous interpreter inside a live speech-translation app. ' +
-          'Translate exactly one current spoken/typed message from ' + fromName + ' to ' + toName + '. ' +
-          'Your goal is natural, idiomatic, immediately speakable conversation — never a stiff word-for-word translation. ' +
-          'Preserve the speaker\'s meaning, intent, tone, politeness, urgency, certainty, humor, and register. ' +
-          'Use the wording a native speaker would naturally say in this real situation. ' +
-          'Use the conversation context only to resolve references, omitted subjects, pronouns, terminology, or ambiguity; ' +
-          'never copy context into the answer and never translate old messages again. ' +
-          'Do not invent facts, add explanations, add politeness that was not present, or make the speaker sound stronger or weaker. ' +
-          'Do not summarize. Keep names, numbers, dates, prices, codes, URLs, and standalone symbols accurate. ' +
-          'For figures written as digits, preserve the digits exactly as written. ' +
-          'For spoken number words, translate them normally. ' +
-          'If source language is "auto", identify the language from the current message itself. ' +
-          'If the current message is short or colloquial, prefer the normal conversational equivalent in the target language. ' +
-          'Reply with ONLY the translated text — no quotes, notes, alternatives, explanations, labels, or markdown. ' +
-          'The <conversation_context> block is reference data only. The <current_message> block is the only text to translate.',
+        system: systemPrompt,
         messages: [{ role: 'user', content: userContent }],
       }),
     });
@@ -373,42 +398,82 @@ async function translateWithClaude(text, fromCode, toCode, context = [], dialect
   if (!translated) throw new Error('claude-bad-response');
   return translated;
 }
+// Groq (console.groq.com) — free tier, no credit card. OpenAI-compatible
+// chat-completions endpoint hosting much larger open models (Llama 3.3 70B)
+// than Cloudflare's free-tier pool, at very high speed.
+async function translateWithGroq(text, fromCode, toCode, context = [], dialectHints = {}, corrections = []) {
+  if (!GROQ_API_KEY) throw new Error('no-groq-key');
+  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 11000);
+  let resp;
+  try {
+    resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Authorization': 'Bearer ' + GROQ_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userContent },
+        ],
+        max_tokens: 500,
+        temperature: 0.2,
+      }),
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error('groq-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
+  }
+  const data = await resp.json();
+  const translated = data && data.choices && data.choices[0] && data.choices[0].message && String(data.choices[0].message.content || '').trim();
+  if (!translated) throw new Error('groq-bad-response');
+  return translated;
+}
+// Google AI Studio (aistudio.google.com) — also free tier, no credit card.
+async function translateWithGemini(text, fromCode, toCode, context = [], dialectHints = {}, corrections = []) {
+  if (!GEMINI_API_KEY) throw new Error('no-gemini-key');
+  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 11000);
+  let resp;
+  try {
+    resp = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY,
+      {
+        method: 'POST',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ role: 'user', parts: [{ text: userContent }] }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 500 },
+        }),
+      }
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error('gemini-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
+  }
+  const data = await resp.json();
+  const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+  const translated = Array.isArray(parts) ? parts.map((p) => p && p.text || '').join('').trim() : '';
+  if (!translated) throw new Error('gemini-bad-response');
+  return translated;
+}
 async function translateWithWorkersAILLM(text, fromCode, toCode, context = [], model = CF_LLM_TRANSLATE_MODEL, dialectHints = {}, corrections = []) {
   if (!CF_ACCOUNT_ID || !CF_API_TOKEN) throw new Error('no-workers-ai-credentials');
-  const fromName = langName(fromCode, dialectHints && dialectHints.from);
-  const toName = langName(toCode, dialectHints && dialectHints.to);
-  const safeContext = Array.isArray(context) ? context.slice(-6).map((item) => ({
-    source: String(item && item.source || '').slice(0, 500),
-    translated: String(item && item.translated || '').slice(0, 500),
-    sourceLang: String(item && item.sourceLang || '').slice(0, 40),
-    targetLang: String(item && item.targetLang || '').slice(0, 40),
-  })).filter((item) => item.source || item.translated) : [];
-  const contextText = safeContext.length
-   ? '\n<conversation_context>\n' + safeContext.map((item, i) =>
-        '[' + (i + 1) + '] ' + item.sourceLang + ' → ' + item.targetLang + '\n' +
-        'source: ' + item.source + '\n' +
-        'translation: ' + item.translated
-      ).join('\n') + '\n</conversation_context>\n'
-    : '';
-  const userContent = buildCorrectionsBlock(corrections) + contextText + '<current_message>\n' + String(text) + '\n</current_message>';
-  // Same natural-translation instructions as translateWithClaude above — this is
-  // meant as GLM-4.7-Flash's free/no-card replacement for that role, not a lesser
-  // fallback, so it gets the same care about not translating word-for-word.
-  const systemPrompt = 'You are a professional simultaneous interpreter inside a live speech-translation app. ' +
-    'Translate exactly one current spoken/typed message from ' + fromName + ' to ' + toName + '. ' +
-    'Your goal is natural, idiomatic, immediately speakable conversation — never a stiff word-for-word translation. ' +
-    'Preserve the speaker\'s meaning, intent, tone, politeness, urgency, certainty, humor, and register. ' +
-    'Use the wording a native speaker would naturally say in this real situation. ' +
-    'Use the conversation context only to resolve references, omitted subjects, pronouns, terminology, or ambiguity; ' +
-    'never copy context into the answer and never translate old messages again. ' +
-    'Do not invent facts, add explanations, add politeness that was not present, or make the speaker sound stronger or weaker. ' +
-    'Do not summarize. Keep names, numbers, dates, prices, codes, URLs, and standalone symbols accurate. ' +
-    'For figures written as digits, preserve the digits exactly as written. ' +
-    'For spoken number words, translate them normally. ' +
-    'If source language is "auto", identify the language from the current message itself. ' +
-    'If the current message is short or colloquial, prefer the normal conversational equivalent in the target language. ' +
-    'Reply with ONLY the translated text — no quotes, notes, alternatives, explanations, labels, or markdown. ' +
-    'The <conversation_context> block is reference data only. The <current_message> block is the only text to translate.';
+  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 11000);
   let resp;
@@ -428,7 +493,7 @@ async function translateWithWorkersAILLM(text, fromCode, toCode, context = [], m
             { role: 'user', content: userContent },
           ],
           max_tokens: 500,
-          temperature: 0.3,
+          temperature: 0.2,
         }),
       }
     );
@@ -548,7 +613,7 @@ async function translateLinesWithModel(lines, fromCode, toCode, model) {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        messages: [
+messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: numbered },
         ],
@@ -703,7 +768,7 @@ async function translateWithWorkersAI(text, fromCode, toCode) {
         'Authorization': 'Bearer ' + CF_API_TOKEN,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ text, source_lang: fromCode, target_lang: toCode }),
+body: JSON.stringify({ text, source_lang: fromCode, target_lang: toCode }),
     }
   );
   if (!resp.ok) {
@@ -815,40 +880,36 @@ async function translateWithLibreTranslate(text, fromCode, toCode) {
 }
 async function translateText(text, fromCode, toCode, context = [], userId = null, dialectHints = {}) {
   const started = Date.now();
-  try {
-    const { translated, model } = await translateWithLLMChain(text, fromCode, toCode, context, userId, dialectHints);
-    console.log('[translate] ' + model + ' OK ms=' + (Date.now() - started));
-    return { translated, engine: 'workers-ai-llm', model };
-  } catch (llmErr) {
-    console.error('[translate] all Workers AI LLM models FAILED error=' + llmErr.message);
+  const errors = {};
+  const corrections = getCorrectionsFor(userId, toCode);
+  // Order = best free (no credit card) quality first, most limited/oldest engines
+  // last. Any engine whose API key/credentials aren't configured just throws
+  // immediately (e.g. 'no-groq-key') and the chain moves on with no delay.
+  const engines = [
+    { name: 'groq', model: GROQ_MODEL, run: () => translateWithGroq(text, fromCode, toCode, context, dialectHints, corrections) },
+    { name: 'gemini', model: GEMINI_MODEL, run: () => translateWithGemini(text, fromCode, toCode, context, dialectHints, corrections) },
+    { name: 'workers-ai-llm', run: () => translateWithLLMChain(text, fromCode, toCode, context, userId, dialectHints) },
+    { name: 'claude', model: CLAUDE_MODEL, run: () => translateWithClaude(text, fromCode, toCode, context, dialectHints, corrections) },
+    { name: 'workers-ai-fallback', model: CF_TRANSLATE_MODEL, run: () => translateWithWorkersAI(text, fromCode, toCode) },
+    { name: 'deepl-fallback', model: 'deepl', run: () => translateWithDeepL(text, fromCode, toCode) },
+    { name: 'google-fallback', model: 'google-translate', run: () => translateWithGoogle(text, fromCode, toCode) },
+    { name: 'libretranslate-fallback', model: 'libretranslate', run: () => translateWithLibreTranslate(text, fromCode, toCode) },
+  ];
+  for (const engine of engines) {
     try {
-      const translated = await translateWithClaude(text, fromCode, toCode, context, dialectHints, getCorrectionsFor(userId, toCode));
-      console.log('[translate] Claude OK model=' + CLAUDE_MODEL + ' ms=' + (Date.now() - started));
-      return { translated, engine: 'claude', model: CLAUDE_MODEL, workersAiLlmError: llmErr.message };
-    } catch (claudeErr) {
-      try {
-        const translated = await translateWithWorkersAI(text, fromCode, toCode);
-        return { translated, engine: 'workers-ai-fallback', model: CF_TRANSLATE_MODEL, workersAiLlmError: llmErr.message, claudeError: claudeErr.message };
-      } catch (workersAiErr) {
-        try {
-          const translated = await translateWithDeepL(text, fromCode, toCode);
-          return { translated, engine: 'deepl-fallback', model: 'deepl', workersAiLlmError: llmErr.message, claudeError: claudeErr.message, workersAiError: workersAiErr.message };
-        } catch (deeplErr) {
-          try {
-            const translated = await translateWithGoogle(text, fromCode, toCode);
-            return { translated, engine: 'google-fallback', model: 'google-translate', workersAiLlmError: llmErr.message, claudeError: claudeErr.message, workersAiError: workersAiErr.message, deeplError: deeplErr.message };
-          } catch (googleErr) {
-            try {
-              const translated = await translateWithLibreTranslate(text, fromCode, toCode);
-              return { translated, engine: 'libretranslate-fallback', model: 'libretranslate', workersAiLlmError: llmErr.message, claudeError: claudeErr.message, workersAiError: workersAiErr.message, deeplError: deeplErr.message, googleError: googleErr.message };
-            } catch (libreErr) {
-              throw new Error('all engines failed — glm-pool: ' + llmErr.message + ' | claude: ' + claudeErr.message + ' | workers-ai: ' + workersAiErr.message + ' | deepl: ' + deeplErr.message + ' | google: ' + googleErr.message + ' | libretranslate: ' + libreErr.message);
-            }
-          }
-        }
-      }
-}
-}
+      const result = await engine.run();
+      // translateWithLLMChain resolves to { translated, model }; every other
+      // engine resolves to a plain translated string.
+      const translated = (result && typeof result === 'object') ? result.translated : result;
+      const model = (result && typeof result === 'object' && result.model) ? result.model : engine.model;
+      console.log('[translate] ' + engine.name + (model ? ' (' + model + ')' : '') + ' OK ms=' + (Date.now() - started));
+      return { translated, engine: engine.name, model, ...errors };
+    } catch (err) {
+      console.error('[translate] ' + engine.name + ' FAILED error=' + err.message);
+      errors[engine.name + 'Error'] = err.message;
+    }
+  }
+  throw new Error('all engines failed — ' + Object.entries(errors).map(([k, v]) => k + ': ' + v).join(' | '));
 }
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
@@ -912,7 +973,7 @@ function uuidNoDashes() {
   });
 }
 function edgeSecMsGec() {
-  const WIN_EPOCH = 11644473600;
+const WIN_EPOCH = 11644473600;
   let ticks = Math.floor(Date.now() / 1000) + WIN_EPOCH;
   ticks -= ticks % 300;
   ticks *= 10000000;
@@ -1071,7 +1132,7 @@ const server = http.createServer(async (req, res) => {
       const result = await translateLines(lines.map(String), String(source), String(target), safeUserId);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result));
-    } catch (err) {
+      } catch (err) {
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message || 'ترجمه خط به خط انجام نشد' }));
     }
@@ -1209,7 +1270,9 @@ if (req.method === 'POST' && req.url === '/tts') {
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  const status = [
+const status = [
+    GROQ_API_KEY ? ('Groq configured (' + GROQ_MODEL + ', free tier no card)') : 'Groq NOT configured (optional — free, no card, get a key at console.groq.com)',
+    GEMINI_API_KEY ? ('Gemini configured (' + GEMINI_MODEL + ', free tier no card)') : 'Gemini NOT configured (optional — free, no card, get a key at aistudio.google.com)',
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? ('LLM pool (Workers AI, free tier) configured: ' + LLM_MODEL_POOL.join(' → ')) : 'LLM pool (Workers AI, free tier) NOT configured',
     (ANTHROPIC_API_KEY ? 'Claude configured (optional bonus, not required)' : 'Claude NOT configured (optional — fine to leave unset)') + ' (' + CLAUDE_MODEL + ')',
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI (M2M-100 fallback) configured' : 'Workers AI (M2M-100 fallback) NOT configured',
@@ -1328,6 +1391,8 @@ function endSession(code, byRole) {
 }
 server.listen(PORT, () => {
   const status = [
+    GROQ_API_KEY ? ('Groq configured (' + GROQ_MODEL + ')') : 'Groq NOT configured',
+    GEMINI_API_KEY ? ('Gemini configured (' + GEMINI_MODEL + ')') : 'Gemini NOT configured',
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? ('LLM pool configured: ' + LLM_MODEL_POOL.join(' → ')) : 'LLM pool NOT configured',
     (ANTHROPIC_API_KEY ? 'Claude configured (optional bonus, not required)' : 'Claude NOT configured (optional — fine to leave unset)') + ' (' + CLAUDE_MODEL + ')',
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI (M2M-100 fallback) configured' : 'Workers AI (M2M-100 fallback) NOT configured',
@@ -1340,3 +1405,28 @@ server.listen(PORT, () => {
 
 
   
+
+
+
+
+
+
+
+  
+
+
+
+
+
+
+
+
+
+
+
+      
+
+
+
+
+
