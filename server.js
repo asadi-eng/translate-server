@@ -61,10 +61,17 @@ const CF_TRANSLATE_MODEL = '@cf/meta/m2m100-1.2b';
 // list is tried automatically before we ever fall back to the literal M2M-100
 // engine. Order = our best-effort default priority, not a proven ranking.
 const LLM_MODEL_POOL = [
-  '@cf/zai-org/glm-4.7-flash',       // primary — fast, strong 100+ language coverage
-  '@cf/google/gemma-4-26b-a4b-it',   // 2nd try — different model family/training data
-  '@cf/moonshotai/kimi-k2.6',        // 3rd try — another independent fallback
+  '@cf/meta/llama-3.1-8b-instruct',            // primary — confirmed free-tier, solid multilingual instruct model
+  '@cf/mistralai/mistral-small-3.1-24b-instruct', // 2nd try — different model family/training data, free-tier
+  '@cf/qwen/qwen2.5-coder-32b-instruct',        // 3rd try — another independent fallback, free-tier
 ];
+// NOTE: glm-4.7-flash and kimi-k2.6 (previously in this pool) now require the
+// Workers AI PAID plan — they return HTTP 403 "not available on the Workers
+// Free plan" on a free account. gemma-4-26b-a4b-it was returning empty
+// responses (workers-ai-llm-bad-response). Swap models here freely if
+// Cloudflare's free-tier catalog changes again — check
+// https://developers.cloudflare.com/workers-ai/models/ for current model IDs
+// and which ones are Free vs Paid before adding one back to this pool.
 const CF_LLM_TRANSLATE_MODEL = LLM_MODEL_POOL[0]; // kept for status/log text below
 const CF_WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
 const sessions = new Map();
@@ -377,7 +384,7 @@ async function translateWithWorkersAILLM(text, fromCode, toCode, context = [], m
     targetLang: String(item && item.targetLang || '').slice(0, 40),
   })).filter((item) => item.source || item.translated) : [];
   const contextText = safeContext.length
-    ? '\n<conversation_context>\n' + safeContext.map((item, i) =>
+   ? '\n<conversation_context>\n' + safeContext.map((item, i) =>
         '[' + (i + 1) + '] ' + item.sourceLang + ' → ' + item.targetLang + '\n' +
         'source: ' + item.source + '\n' +
         'translation: ' + item.translated
@@ -449,7 +456,7 @@ function looksSuspiciousTranslation(source, translated, fromCode, toCode) {
   const s = String(source || '').trim();
   const t = String(translated || '').trim();
   if (!t) return true;
-  if (fromCode !== toCode && fromCode !== 'auto' && s.length > 8 && s.toLowerCase() === t.toLowerCase()) return true;
+  if (fromCode !== toCode && s.length > 8 && s.toLowerCase() === t.toLowerCase()) return true;
   if (s.length > 40 && t.length < s.length * 0.15) return true;
   return false;
 }
@@ -462,7 +469,7 @@ function looksSuspiciousTranslation(source, translated, fromCode, toCode) {
 // should move on rather than silently accept it.
 function looksSuspiciousLinesTranslation(sourceLines, translatedLines, fromCode, toCode) {
   if (!Array.isArray(translatedLines) || translatedLines.length !== sourceLines.length) return true;
-  if (fromCode === toCode || fromCode === 'auto') return false;
+  if (fromCode === toCode) return false;
   let substantial = 0;
   let identical = 0;
   for (let i = 0; i < sourceLines.length; i++) {
@@ -707,7 +714,7 @@ async function translateWithWorkersAI(text, fromCode, toCode) {
   if (!data || data.success === false) {
     const apiErr = data && data.errors && data.errors[0] && data.errors[0].message;
     throw new Error('workers-ai-api-error' + (apiErr ? ': ' + apiErr : ''));
-  }
+    }
   const translated = data && data.result && data.result.translated_text;
   if (!translated) throw new Error('workers-ai-bad-response');
   return translated;
@@ -840,8 +847,8 @@ async function translateText(text, fromCode, toCode, context = [], userId = null
           }
         }
       }
-    }
-  }
+}
+}
 }
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
@@ -1068,8 +1075,8 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: err.message || 'ثبت بازخورد انجام نشد' }));
     }
     return;
-  }
-  if (req.method === 'POST' && req.url === '/correction') {
+}
+ if (req.method === 'POST' && req.url === '/correction') {
     try {
       const body = await readJsonBody(req, 5000);
       const { userId, targetLang, source, bad, fixed } = body;
@@ -1292,11 +1299,8 @@ server.listen(PORT, () => {
     ELEVENLABS_API_KEY ? 'ElevenLabs TTS configured' : 'ElevenLabs TTS NOT configured',
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
-});
+}); 
 
 
 
-
-
-
-
+  
