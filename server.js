@@ -85,6 +85,17 @@ const LLM_MODEL_POOL = [
 // https://developers.cloudflare.com/workers-ai/models/ for current model IDs
 // and which ones are Free vs Paid before adding one back to this pool.
 const CF_LLM_TRANSLATE_MODEL = LLM_MODEL_POOL[0]; // kept for status/log text below
+// SMART LANGUAGE ROUTER — Groq/Gemini priority by target language; no Cloudflare key required.
+const LANGUAGE_ENGINE_ROUTER = {
+  fa:'groq', ar:'groq', en:'gemini', tr:'groq', fr:'gemini', de:'gemini', es:'gemini', it:'gemini',
+  ru:'groq', ja:'gemini', ko:'gemini', hi:'gemini', ur:'groq', pt:'gemini', nl:'gemini', sv:'gemini',
+  pl:'gemini', uk:'gemini', id:'gemini', vi:'gemini', th:'gemini', he:'gemini', el:'gemini', ro:'gemini',
+  bn:'gemini', ms:'gemini'
+};
+function getLanguageEngine(toCode) {
+  const code = String(toCode || '').toLowerCase().split('-')[0];
+  return LANGUAGE_ENGINE_ROUTER[code] || 'groq';
+}
 const CF_WHISPER_MODEL = '@cf/openai/whisper-large-v3-turbo';
 const sessions = new Map();
 
@@ -889,16 +900,28 @@ async function translateText(text, fromCode, toCode, context = [], userId = null
   // Order = best free (no credit card) quality first, most limited/oldest engines
   // last. Any engine whose API key/credentials aren't configured just throws
   // immediately (e.g. 'no-groq-key') and the chain moves on with no delay.
-  let engines = [
-    { name: 'groq', model: GROQ_MODEL, run: () => translateWithGroq(text, fromCode, toCode, context, dialectHints, corrections) },
-    { name: 'gemini', model: GEMINI_MODEL, run: () => translateWithGemini(text, fromCode, toCode, context, dialectHints, corrections) },
-    { name: 'workers-ai-llm', run: () => translateWithLLMChain(text, fromCode, toCode, context, userId, dialectHints) },
-    { name: 'claude', model: CLAUDE_MODEL, run: () => translateWithClaude(text, fromCode, toCode, context, dialectHints, corrections) },
-    { name: 'workers-ai-fallback', model: CF_TRANSLATE_MODEL, run: () => translateWithWorkersAI(text, fromCode, toCode) },
-    { name: 'deepl-fallback', model: 'deepl', run: () => translateWithDeepL(text, fromCode, toCode) },
-    { name: 'google-fallback', model: 'google-translate', run: () => translateWithGoogle(text, fromCode, toCode) },
-    { name: 'libretranslate-fallback', model: 'libretranslate', run: () => translateWithLibreTranslate(text, fromCode, toCode) },
-  ];
+const preferredLanguageEngine = getLanguageEngine(toCode);
+let engines = preferredLanguageEngine === 'gemini'
+  ? [
+      { name:'gemini', model:GEMINI_MODEL, run:()=>translateWithGemini(text,fromCode,toCode,context,dialectHints,corrections) },
+      { name:'groq', model:GROQ_MODEL, run:()=>translateWithGroq(text,fromCode,toCode,context,dialectHints,corrections) },
+      { name:'workers-ai-llm', run:()=>translateWithLLMChain(text,fromCode,toCode,context,userId,dialectHints) },
+      { name:'claude', model:CLAUDE_MODEL, run:()=>translateWithClaude(text,fromCode,toCode,context,dialectHints,corrections) },
+      { name:'workers-ai-fallback', model:CF_TRANSLATE_MODEL, run:()=>translateWithWorkersAI(text,fromCode,toCode) },
+      { name:'deepl-fallback', model:'deepl', run:()=>translateWithDeepL(text,fromCode,toCode) },
+      { name:'google-fallback', model:'google-translate', run:()=>translateWithGoogle(text,fromCode,toCode) },
+      { name:'libretranslate-fallback', model:'libretranslate', run:()=>translateWithLibreTranslate(text,fromCode,toCode) }
+    ]
+  : [
+      { name:'groq', model:GROQ_MODEL, run:()=>translateWithGroq(text,fromCode,toCode,context,dialectHints,corrections) },
+      { name:'gemini', model:GEMINI_MODEL, run:()=>translateWithGemini(text,fromCode,toCode,context,dialectHints,corrections) },
+      { name:'workers-ai-llm', run:()=>translateWithLLMChain(text,fromCode,toCode,context,userId,dialectHints) },
+      { name:'claude', model:CLAUDE_MODEL, run:()=>translateWithClaude(text,fromCode,toCode,context,dialectHints,corrections) },
+      { name:'workers-ai-fallback', model:CF_TRANSLATE_MODEL, run:()=>translateWithWorkersAI(text,fromCode,toCode) },
+      { name:'deepl-fallback', model:'deepl', run:()=>translateWithDeepL(text,fromCode,toCode) },
+      { name:'google-fallback', model:'google-translate', run:()=>translateWithGoogle(text,fromCode,toCode) },
+      { name:'libretranslate-fallback', model:'libretranslate', run:()=>translateWithLibreTranslate(text,fromCode,toCode) }
+    ];
   // The person chose a specific engine in Settings instead of "auto" — try that
   // one first, then still fall through to the rest of the chain on failure so a
   // translation still comes back rather than a hard error.
