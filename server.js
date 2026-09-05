@@ -453,6 +453,30 @@ function looksSuspiciousTranslation(source, translated, fromCode, toCode) {
   if (s.length > 40 && t.length < s.length * 0.15) return true;
   return false;
 }
+// Same idea as looksSuspiciousTranslation above, but for a whole photo/OCR batch
+// of lines at once: some entries are legitimately expected to come back
+// unchanged (brand names, numbers, a stray logo fragment), so a single matching
+// line is normal — but if MOST of the substantial lines are byte-identical to
+// the source when the languages actually differ, the model almost certainly
+// just echoed the whole block back instead of translating it, and the chain
+// should move on rather than silently accept it.
+function looksSuspiciousLinesTranslation(sourceLines, translatedLines, fromCode, toCode) {
+  if (!Array.isArray(translatedLines) || translatedLines.length !== sourceLines.length) return true;
+  if (fromCode === toCode || fromCode === 'auto') return false;
+  let substantial = 0;
+  let identical = 0;
+  for (let i = 0; i < sourceLines.length; i++) {
+    const s = String(sourceLines[i] || '').trim();
+    const t = String(translatedLines[i] || '').trim();
+    // Only count lines with real letter content and some length — skip bare
+    // numbers, single symbols, empty entries, which are fine to pass through.
+    if (s.length < 4 || !/[a-zA-Z\u00C0-\u024F\u0600-\u06FF]/.test(s)) continue;
+    substantial++;
+    if (s.toLowerCase() === t.toLowerCase()) identical++;
+  }
+  if (substantial < 2) return false; // too little to judge reliably
+  return (identical / substantial) >= 0.7;
+}
 // Tries each still-allowed model in LLM_MODEL_POOL, in order, for this
 // user+language. Skips models the user has disliked before, and models that
 // hit the global ban threshold for this language. Moves to the next model on
@@ -555,7 +579,13 @@ async function translateLinesWithWorkersAILLM(lines, fromCode, toCode, userId) {
   let lastErr = null;
   for (const model of candidates) {
     try {
-      return await translateLinesWithModel(lines, fromCode, toCode, model);
+      const translated = await translateLinesWithModel(lines, fromCode, toCode, model);
+      if (looksSuspiciousLinesTranslation(lines, translated, fromCode, toCode)) {
+        console.warn('[translate-lines] ' + model + ' returned an echoed/untranslated block for ' + fromCode + '->' + toCode + ', trying next model');
+        lastErr = new Error(model + '-suspicious-lines-response');
+        continue;
+      }
+      return translated;
     } catch (err) {
       console.error('[translate-lines] ' + model + ' FAILED error=' + err.message);
       lastErr = err;
@@ -642,6 +672,9 @@ async function translateLines(lines, fromCode, toCode, userId) {
   } catch (llmErr) {
     try {
       const translated = await translateLinesWithClaude(lines, fromCode, toCode);
+      if (looksSuspiciousLinesTranslation(lines, translated, fromCode, toCode)) {
+        throw new Error('claude-lines-echoed-untranslated-block');
+      }
       return { translated, engine: 'claude-lines', workersAiLlmError: llmErr.message };
     } catch (claudeErr) {
       try {
@@ -877,7 +910,7 @@ function synthesizeEdgeTts(text, bcp) {
       clearTimeout(timer);
       try { ws.close(); } catch (_) {}
       fn(arg);
-    };
+      };
     ws.on('error', (err) => finish(reject, new Error('edge-socket-error' + (err && err.message ? ': ' + err.message : ''))));
     ws.on('open', () => {
       const ts = new Date().toISOString();
@@ -1156,7 +1189,7 @@ wss.on('connection', (ws) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
     if (msg.type === 'create') {
-    const code = makeCode();
+      const code = makeCode();
       sessions.set(code, { host: ws, guest: null, hostLang: msg.lang, guestLang: null });
       ws.role = 'host';
       ws.code = code;
@@ -1259,9 +1292,7 @@ server.listen(PORT, () => {
     ELEVENLABS_API_KEY ? 'ElevenLabs TTS configured' : 'ElevenLabs TTS NOT configured',
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
-});  
-
-
+});
 
 
 
