@@ -928,7 +928,19 @@ function synthesizeEdgeTts(text, bcp, gender) {
     const gec = edgeSecMsGec();
     const wsUrl = 'wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1'
       + '?TrustedClientToken=' + EDGE_TTS_TOKEN + '&Sec-MS-GEC=' + gec + '&Sec-MS-GEC-Version=' + EDGE_CLIENT_VERSION;    let ws;
-    try { ws = new WebSocket(wsUrl); } catch (e) { reject(e); return; }
+     try {
+      const uaVersion = EDGE_CLIENT_VERSION.split('-')[1] || '131.0.2903.0';
+      ws = new WebSocket(wsUrl, {
+        headers: {
+          'Pragma': 'no-cache',
+          'Cache-Control': 'no-cache',
+          'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + uaVersion + ' Safari/537.36 Edg/' + uaVersion,
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+    } catch (e) { reject(e); return; }
     const audioParts = [];
     let settled = false;
     const timer = setTimeout(() => finish(reject, new Error('edge-timeout')), Math.max(8000, text.length * 150));
