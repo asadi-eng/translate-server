@@ -1159,7 +1159,7 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-  if (req.method === 'POST' && req.url === '/tts') {
+if (req.method === 'POST' && req.url === '/tts') {
     try {
       const body = await readJsonBody(req, 5000);
       const { text, bcp, gender } = body;
@@ -1168,6 +1168,7 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'text و bcp لازم است' }));
         return;
       }
+      console.log('[tts] request bcp=' + String(bcp) + ' gender=' + String(gender || '-') + ' chars=' + String(text).length);
       let audio, engine;
       try {
         audio = await synthesizeElevenLabsTts(String(text));
@@ -1181,10 +1182,12 @@ const server = http.createServer(async (req, res) => {
             audio = await synthesizeGoogleTts(String(text), String(bcp).slice(0, 2));
             engine = 'google-fallback';
           } catch (googleErr) {
+            console.error('[tts] ALL ENGINES FAILED bcp=' + String(bcp) + ' elevenlabs=' + elevenErr.message + ' | edge=' + edgeErr.message + ' | google=' + googleErr.message);
             throw new Error('elevenlabs: ' + elevenErr.message + ' | edge: ' + edgeErr.message + ' | google: ' + googleErr.message);
           }
         }
       }
+      console.log('[tts] OK bcp=' + String(bcp) + ' engine=' + engine + ' bytes=' + audio.length);
       res.writeHead(200, { 'Content-Type': 'audio/mpeg', 'X-TTS-Engine': engine });
       res.end(audio);
     } catch (err) {
