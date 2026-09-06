@@ -336,7 +336,7 @@ function buildCorrectionsBlock(corrections) {
 // Shared by every single-message translation engine (Claude, Workers AI LLM
 // pool, Groq, Gemini) so the instructions — including the greeting/farewell
 // anti-confusion rule — never drift out of sync between engines.
-function buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections) {
+function buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections, avoidTranslation) {
   const fromName = langName(fromCode, dialectHints && dialectHints.from);
   const toName = langName(toCode, dialectHints && dialectHints.to);
   const safeContext = Array.isArray(context) ? context.slice(-6).map((item) => ({
@@ -369,18 +369,36 @@ function buildTranslationPromptParts(text, fromCode, toCode, context, dialectHin
     'target language\'s own OPENING greeting, never its farewell — for example into Persian that is "سلام", never "خداحافظی". ' +
     'Likewise "bye"/"goodbye" must become the target language\'s farewell, never its greeting. ' +
     'Before answering, re-check that the first word of your translation matches the sense (greeting vs. farewell, yes vs. no, etc.) of the first word of the source message. ' +
+    'Your entire output must be written in ' + toName + ' — never leave a source-language word, filler word, or phrase untranslated inside an otherwise-' + toName + ' sentence, and never mix two languages in one output. ' +
+    'This includes the WRITING SYSTEM, not just the vocabulary: even a common loanword or filler (like "okay", "ok", "wow", "hi") must be written phonetically in ' + toName + '\'s own script/alphabet the way a native speaker would normally write it there — never left in Latin letters (or any other foreign script) inside a ' + toName + ' sentence. ' +
+    'The only exceptions are proper nouns (personal names, brand names, place names) and terms that have no real equivalent in ' + toName + ' at all. ' +
+    'Additionally, whenever you keep a word as a genuine LOANWORD from another language (most often English) rather than fully translating it — e.g. "okay", "wow", "bye", "cool" kept as loanwords instead of translated — wrap ONLY that one word using this exact marker: {{<phonetic spelling in ' + toName + '\'s own script>|<the word in its original spelling>}}. ' +
+    'Example: translating the English filler "okay" into Persian, when you decide to keep it as a loanword, write {{اوکی|okay}} instead of writing "اوکی" or "okay" alone. ' +
+    'Only use this marker for genuine loanwords being kept in their borrowed form — never wrap a normal, fully-translated ' + toName + ' word in it, and never use it for proper nouns. ' +
+    'Before answering, re-read your own draft translation and rewrite any leftover source-language word you find (applying the loanword marker above where appropriate), so the final text you send is fully and only in ' + toName + '. ' +
     'If source language is "auto", identify the language from the current message itself. ' +
     'If the current message is short or colloquial, prefer the normal conversational equivalent in the target language. ' +
     'The <current_message> text came from real-time speech recognition and may occasionally be garbled, contain the wrong script, or look like it is in a different language than stated because the recognizer misheard the audio — this is normal and expected, NOT something to point out. ' +
     'Never comment on this, never say the input seems wrong/mistaken/not-really-that-language, never ask for clarification, never explain what you are about to do. ' +
     'Just translate the <current_message> text itself as literally and faithfully as you can into ' + toName + ', treating it as real spoken content regardless of how it looks — your entire reply must be ONLY that translation, in ' + toName + ', and nothing else. ' +
     'Reply with ONLY the translated text — no quotes, notes, alternatives, explanations, labels, or markdown. ' +
-    'The <conversation_context> block is reference data only. The <current_message> block is the only text to translate.';
+    'The <conversation_context> block is reference data only. The <current_message> block is the only text to translate.' +
+    // Only present on a 👎 retry: the person rejected this model's previous
+    // attempt at this exact message and we're asking the SAME model to try
+    // again (see retranslateWithSameEngineModel) rather than immediately
+    // rotating to a different, weaker model. Tell it plainly what went wrong
+    // so it doesn't just hand back a lightly-reworded copy of the same answer.
+    (avoidTranslation ? (
+      ' <previous_rejected_attempt>Your previous translation of this exact <current_message> was rejected by the user: "' +
+      String(avoidTranslation).slice(0, 500).replace(/"/g, '\'').replace(/\s+/g, ' ') +
+      '". Do not repeat it and do not make only a trivial/cosmetic change to it — actually re-translate the <current_message> correctly into ' + toName + '. ' +
+      'A common cause of rejection is that the previous attempt was left in ' + fromName + ' (or only reworded within it) instead of genuinely switching to ' + toName + ' — double-check your new answer is fully and only in ' + toName + ' and its own script before replying.</previous_rejected_attempt>'
+    ) : '');
   return { systemPrompt, userContent };
 }
-async function translateWithClaude(text, fromCode, toCode, context = [], dialectHints = {}, corrections = []) {
+async function translateWithClaude(text, fromCode, toCode, context = [], dialectHints = {}, corrections = [], avoidTranslation = null) {
   if (!ANTHROPIC_API_KEY) throw new Error('no-anthropic-key');
-  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections);
+  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections, avoidTranslation);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 11000);
   let resp;
@@ -415,9 +433,9 @@ async function translateWithClaude(text, fromCode, toCode, context = [], dialect
 // Groq (console.groq.com) — free tier, no credit card. OpenAI-compatible
 // chat-completions endpoint hosting much larger open models (Llama 3.3 70B)
 // than Cloudflare's free-tier pool, at very high speed.
-async function translateWithGroq(text, fromCode, toCode, context = [], dialectHints = {}, corrections = []) {
+async function translateWithGroq(text, fromCode, toCode, context = [], dialectHints = {}, corrections = [], avoidTranslation = null) {
   if (!GROQ_API_KEY) throw new Error('no-groq-key');
-  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections);
+  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections, avoidTranslation);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 11000);
   let resp;
@@ -436,7 +454,7 @@ async function translateWithGroq(text, fromCode, toCode, context = [], dialectHi
           { role: 'user', content: userContent },
         ],
         max_tokens: 500,
-        temperature: 0.2,
+        temperature: avoidTranslation ? 0.5 : 0.2,
       }),
     });
   } finally {
@@ -452,9 +470,9 @@ async function translateWithGroq(text, fromCode, toCode, context = [], dialectHi
   return translated;
 }
 // Google AI Studio (aistudio.google.com) — also free tier, no credit card.
-async function translateWithGemini(text, fromCode, toCode, context = [], dialectHints = {}, corrections = []) {
+async function translateWithGemini(text, fromCode, toCode, context = [], dialectHints = {}, corrections = [], avoidTranslation = null) {
   if (!GEMINI_API_KEY) throw new Error('no-gemini-key');
-  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections);
+  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections, avoidTranslation);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 11000);
   let resp;
@@ -468,7 +486,7 @@ async function translateWithGemini(text, fromCode, toCode, context = [], dialect
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents: [{ role: 'user', parts: [{ text: userContent }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 500 },
+          generationConfig: { temperature: avoidTranslation ? 0.5 : 0.2, maxOutputTokens: 500 },
         }),
       }
     );
@@ -485,9 +503,9 @@ async function translateWithGemini(text, fromCode, toCode, context = [], dialect
   if (!translated) throw new Error('gemini-bad-response');
   return translated;
 }
-async function translateWithWorkersAILLM(text, fromCode, toCode, context = [], model = CF_LLM_TRANSLATE_MODEL, dialectHints = {}, corrections = []) {
+async function translateWithWorkersAILLM(text, fromCode, toCode, context = [], model = CF_LLM_TRANSLATE_MODEL, dialectHints = {}, corrections = [], avoidTranslation = null) {
   if (!CF_ACCOUNT_ID || !CF_API_TOKEN) throw new Error('no-workers-ai-credentials');
-  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections);
+  const { systemPrompt, userContent } = buildTranslationPromptParts(text, fromCode, toCode, context, dialectHints, corrections, avoidTranslation);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 11000);
   let resp;
@@ -507,7 +525,7 @@ async function translateWithWorkersAILLM(text, fromCode, toCode, context = [], m
             { role: 'user', content: userContent },
           ],
           max_tokens: 500,
-          temperature: 0.2,
+          temperature: avoidTranslation ? 0.5 : 0.2,
         }),
       }
     );
@@ -527,16 +545,64 @@ async function translateWithWorkersAILLM(text, fromCode, toCode, context = [], m
   if (!translated) throw new Error('workers-ai-llm-bad-response');
   return translated;
 }
-// Rough, cheap sanity check — NOT a quality judge. Only meant to catch the two
-// clearest failure shapes (an empty/near-empty reply, or a reply that's just
-// the source text handed back untouched) so the chain moves to the next model
-// instead of quietly returning a broken translation.
+// Maps a language code to the Unicode script family a real translation into
+// it should be dominated by. Codes not listed here (mixed-script or Latin-based
+// with no distinctive extra range) are simply skipped by the check below.
+const SCRIPT_FAMILY_FOR_LANG = {
+  fa: 'arabic', ar: 'arabic', ur: 'arabic',
+  ru: 'cyrillic', uk: 'cyrillic',
+  ja: 'cjk', ko: 'hangul', hi: 'devanagari', th: 'thai', he: 'hebrew',
+  el: 'greek', bn: 'bengali',
+  en: 'latin', tr: 'latin', fr: 'latin', de: 'latin', es: 'latin', it: 'latin',
+  pt: 'latin', nl: 'latin', sv: 'latin', pl: 'latin', id: 'latin', vi: 'latin',
+  ro: 'latin', ms: 'latin',
+};
+const SCRIPT_RANGES = {
+  arabic: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/g,
+  cyrillic: /[\u0400-\u04FF]/g,
+  cjk: /[\u3040-\u30FF\u4E00-\u9FFF]/g,
+  hangul: /[\uAC00-\uD7AF]/g,
+  devanagari: /[\u0900-\u097F]/g,
+  thai: /[\u0E00-\u0E7F]/g,
+  hebrew: /[\u0590-\u05FF]/g,
+  greek: /[\u0370-\u03FF]/g,
+  bengali: /[\u0980-\u09FF]/g,
+  latin: /[A-Za-z\u00C0-\u024F]/g,
+};
+// Counts characters of each known script family and returns whichever one has
+// the most — a cheap, good-enough "what script is this text actually written
+// in" check without pulling in a real language-detection library.
+function dominantScriptOf(text) {
+  const s = String(text || '');
+  let best = null, bestCount = 0;
+  for (const family of Object.keys(SCRIPT_RANGES)) {
+    const matches = s.match(SCRIPT_RANGES[family]);
+    const count = matches ? matches.length : 0;
+    if (count > bestCount) { bestCount = count; best = family; }
+  }
+  return bestCount >= 3 ? best : null; // too little script-bearing text to judge
+}
+// Rough, cheap sanity check — NOT a quality judge. Meant to catch three clear
+// failure shapes so the chain moves to the next model instead of quietly
+// returning a broken translation: an empty/near-empty reply, a reply that's
+// just the source text handed back untouched, or — the sneaky one, seen from
+// weaker fallback models — a reply that's REWORDED but still written in the
+// SOURCE language's script instead of actually switching to the target one
+// (e.g. asked for fa->en and it just paraphrases in Persian again).
 function looksSuspiciousTranslation(source, translated, fromCode, toCode) {
   const s = String(source || '').trim();
   const t = String(translated || '').trim();
   if (!t) return true;
   if (fromCode !== toCode && s.length > 8 && s.toLowerCase() === t.toLowerCase()) return true;
   if (s.length > 40 && t.length < s.length * 0.15) return true;
+  if (fromCode !== toCode && fromCode !== 'auto') {
+    const expectedScript = SCRIPT_FAMILY_FOR_LANG[toCode];
+    const sourceScript = SCRIPT_FAMILY_FOR_LANG[fromCode];
+    if (expectedScript && sourceScript && expectedScript !== sourceScript) {
+      const actualScript = dominantScriptOf(t);
+      if (actualScript && actualScript === sourceScript && actualScript !== expectedScript) return true;
+    }
+  }
   return false;
 }
 // Same idea as looksSuspiciousTranslation above, but for a whole photo/OCR batch
@@ -549,8 +615,12 @@ function looksSuspiciousTranslation(source, translated, fromCode, toCode) {
 function looksSuspiciousLinesTranslation(sourceLines, translatedLines, fromCode, toCode) {
   if (!Array.isArray(translatedLines) || translatedLines.length !== sourceLines.length) return true;
   if (fromCode === toCode) return false;
+  const expectedScript = SCRIPT_FAMILY_FOR_LANG[toCode];
+  const sourceScript = SCRIPT_FAMILY_FOR_LANG[fromCode];
+  const checkScript = fromCode !== 'auto' && expectedScript && sourceScript && expectedScript !== sourceScript;
   let substantial = 0;
   let identical = 0;
+  let stillSourceScript = 0;
   for (let i = 0; i < sourceLines.length; i++) {
     const s = String(sourceLines[i] || '').trim();
     const t = String(translatedLines[i] || '').trim();
@@ -559,9 +629,14 @@ function looksSuspiciousLinesTranslation(sourceLines, translatedLines, fromCode,
     if (s.length < 4 || !/[a-zA-Z\u00C0-\u024F\u0600-\u06FF]/.test(s)) continue;
     substantial++;
     if (s.toLowerCase() === t.toLowerCase()) identical++;
+    if (checkScript && dominantScriptOf(t) === sourceScript) stillSourceScript++;
   }
   if (substantial < 2) return false; // too little to judge reliably
-  return (identical / substantial) >= 0.7;
+  if ((identical / substantial) >= 0.7) return true;
+  // Same "reworded but never actually switched script" failure as the single-
+  // message check above, just judged across the whole batch instead of one line.
+  if (checkScript && (stillSourceScript / substantial) >= 0.7) return true;
+  return false;
 }
 // Tries each still-allowed model in LLM_MODEL_POOL, in order, for this
 // user+language. Skips models the user has disliked before, and models that
@@ -588,13 +663,45 @@ async function translateWithLLMChain(text, fromCode, toCode, context, userId, di
   }
   throw lastErr || new Error('llm-chain-exhausted');
 }
-async function translateLinesWithModel(lines, fromCode, toCode, model) {
-  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) throw new Error('no-workers-ai-credentials');
-  const fromName = langName(fromCode);
-  const toName = langName(toCode);
-  const numbered = lines.map((l, i) => (i + 1) + '. ' + String(l).replace(/\s+/g, ' ').trim()).join('\n');
-  // Same photo-OCR translation instructions as translateLinesWithClaude above.
-  const systemPrompt = 'You are the translation engine behind a live camera-overlay translation feature (like Google Lens), ' +
+// Re-runs translation with the SAME engine+model that produced a translation
+// the user just disliked, asking it (via the <previous_rejected_attempt> block
+// added in buildTranslationPromptParts) to genuinely redo it rather than
+// rotate straight down to the next, usually weaker, model in the chain. Only
+// on a real failure or another suspicious-looking result does the caller
+// (the /retry-same-model route below) fall through to the normal chain.
+async function retranslateWithSameEngineModel({ text, fromCode, toCode, context, userId, dialectHints, engine, model, previousTranslation }) {
+  const corrections = getCorrectionsFor(userId, toCode);
+  let translated;
+  switch (engine) {
+    case 'gemini':
+      translated = await translateWithGemini(text, fromCode, toCode, context, dialectHints, corrections, previousTranslation);
+      break;
+    case 'groq':
+      translated = await translateWithGroq(text, fromCode, toCode, context, dialectHints, corrections, previousTranslation);
+      break;
+    case 'claude':
+      translated = await translateWithClaude(text, fromCode, toCode, context, dialectHints, corrections, previousTranslation);
+      break;
+case 'workers-ai-llm':
+      if (!model) throw new Error('retry-missing-model-for-workers-ai-llm');
+      translated = await translateWithWorkersAILLM(text, fromCode, toCode, context, model, dialectHints, corrections, previousTranslation);
+      break;
+    default:
+      // The literal fallback engines (m2m100, deepl, google, libretranslate)
+      // aren't LLMs and have no notion of "try again differently" — nothing to
+      // retry, so the caller should go straight to the normal fallback chain.
+      throw new Error('retry-not-supported-for-engine-' + engine);
+  }
+  if (looksSuspiciousTranslation(text, translated, fromCode, toCode)) {
+    throw new Error((model || engine) + '-retry-still-suspicious');
+  }
+  return translated;
+}
+// Shared by translateLinesWithModel and translateLinesWithClaude below — used
+// to be pasted twice ("Same photo-OCR translation instructions as ... above"),
+// which is exactly how the two copies could silently drift out of sync.
+function buildLinesSystemPrompt(fromName, toName, lineCount) {
+  return 'You are the translation engine behind a live camera-overlay translation feature (like Google Lens), ' +
     'translating text that was detected on a photographed image, from ' + fromName + ' to ' + toName + '. ' +
     'You will receive a numbered list. Each number is already a merged block of nearby on-image text that has been ' +
     'grouped together because it likely forms one running sentence/paragraph/caption — NOT an arbitrary single OCR ' +
@@ -603,13 +710,22 @@ async function translateLinesWithModel(lines, fromCode, toCode, model) {
     'pronoun/reference that continues from one entry to the next stay consistent — but you MUST reply with a ' +
     'translation for EVERY numbered entry, in the exact same order and exact same count as the input, one output ' +
     'entry per input entry. Never merge two input entries into one output entry or split one input entry into two. ' +
-    'If an entry is just a stray character, a number, a logo fragment, or otherwise not real translatable text, ' +
-    'still return an entry for it (repeat it as-is or return an empty string), so the count always matches. ' +
+    'Every entry you receive already passed a filter that requires real letters in it, so nothing here is actually a ' +
+    'bare number/symbol with no real words in it — do not second-guess that and blank one out anyway. A short entry, ' +
+    'a stylized heading, a marketing tagline, or something that looks like it could be a brand name (e.g. "AI Labs", ' +
+    '"beyond translation", a product name) still contains real words and MUST be genuinely translated like any other ' +
+    'entry — never left blank and never returned unchanged just because it is short or looks like branding/a heading. ' +
+    'Returning an empty string is reserved ONLY for the rare case an entry truly has no translatable words at all (a ' +
+    'lone digit, a bare symbol) — if that ever happens, still return an entry for it (repeat it as-is or return an ' +
+    'empty string) so the count always matches. ' +
     'Translate each entry the way a skilled bilingual native speaker would naturally phrase it — smooth, idiomatic, ' +
     'full-sentence phrasing in the target language, never a stiff word-for-word rendering, and never a fragment ' +
     'that only makes sense chained to a neighboring entry. Watch for words that are ambiguous in isolation but not ' +
     'in context (e.g. a verb that can mean either "want/like to" or "love", depending on what follows it) — use the ' +
     'surrounding entries to pick the sense that actually fits, rather than defaulting to the most literal one. ' +
+    'Also watch for common English marketing idioms whose literal wording would flip the intended meaning if translated ' +
+    'word-for-word — for example "going beyond X" or "more than X" means doing MORE than / in addition to X, never ' +
+    'leaving or exiting X; translate the intended sense of the whole phrase, not each word on its own. ' +
     'Never translate or alter numerals written as figures (e.g. "1", "2024", "۱۲", "01", "2/4"), dates, prices, codes, ' +
     'or standalone symbols/logos — copy those through exactly as they appear in the source text. This does NOT apply ' +
     'to spelled-out number words ("one", "two", "یک", "دو", "سه") — those are ordinary vocabulary and must be ' +
@@ -617,7 +733,14 @@ async function translateLinesWithModel(lines, fromCode, toCode, model) {
     'surrounding words around a figure, never the figure itself. Each translated entry gets redrawn as one block covering the merged area its source text occupied ' +
     'on the photo, so it does NOT need to match the original\'s length line-for-line — prioritize a natural, correctly ' +
     'worded sentence over matching length. Reply with ONLY a raw JSON array of strings — no markdown, no code ' +
-    'fence, no commentary — with exactly ' + lines.length + ' items in order.';
+    'fence, no commentary — with exactly ' + lineCount + ' items in order.';
+}
+async function translateLinesWithModel(lines, fromCode, toCode, model) {
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) throw new Error('no-workers-ai-credentials');
+  const fromName = langName(fromCode);
+  const toName = langName(toCode);
+  const numbered = lines.map((l, i) => (i + 1) + '. ' + String(l).replace(/\s+/g, ' ').trim()).join('\n');
+  const systemPrompt = buildLinesSystemPrompt(fromName, toName, lines.length);
   const resp = await fetch(
     'https://api.cloudflare.com/client/v4/accounts/' + CF_ACCOUNT_ID + '/ai/run/' + model,
     {
@@ -694,30 +817,7 @@ async function translateLinesWithClaude(lines, fromCode, toCode) {
     body: JSON.stringify({
       model: CLAUDE_MODEL,
       max_tokens: Math.min(4000, Math.max(500, lines.length * 150)),
-      system: 'You are the translation engine behind a live camera-overlay translation feature (like Google Lens), ' +
-        'translating text that was detected on a photographed image, from ' + fromName + ' to ' + toName + '. ' +
-        'You will receive a numbered list. Each number is already a merged block of nearby on-image text that has been ' +
-        'grouped together because it likely forms one running sentence/paragraph/caption — NOT an arbitrary single OCR ' +
-        'line — so treat each numbered entry as a real chunk of prose to translate as a whole, not as an isolated word ' +
-        'or fragment to be guessed at out of context. Read all the entries together so terminology, tone, and any ' +
-        'pronoun/reference that continues from one entry to the next stay consistent — but you MUST reply with a ' +
-        'translation for EVERY numbered entry, in the exact same order and exact same count as the input, one output ' +
-        'entry per input entry. Never merge two input entries into one output entry or split one input entry into two. ' +
-        'If an entry is just a stray character, a number, a logo fragment, or otherwise not real translatable text, ' +
-        'still return an entry for it (repeat it as-is or return an empty string), so the count always matches. ' +
-        'Translate each entry the way a skilled bilingual native speaker would naturally phrase it — smooth, idiomatic, ' +
-        'full-sentence phrasing in the target language, never a stiff word-for-word rendering, and never a fragment ' +
-        'that only makes sense chained to a neighboring entry. Watch for words that are ambiguous in isolation but not ' +
-        'in context (e.g. a verb that can mean either "want/like to" or "love", depending on what follows it) — use the ' +
-        'surrounding entries to pick the sense that actually fits, rather than defaulting to the most literal one. ' +
-        'Never translate or alter numerals written as figures (e.g. "1", "2024", "۱۲", "01", "2/4"), dates, prices, codes, ' +
-        'or standalone symbols/logos — copy those through exactly as they appear in the source text. This does NOT apply ' +
-        'to spelled-out number words ("one", "two", "یک", "دو", "سه") — those are ordinary vocabulary and must be ' +
-        'translated like any other word, into the equivalent number word in the target language. Only translate the ' +
-        'surrounding words around a figure, never the figure itself. Each translated entry gets redrawn as one block covering the merged area its source text occupied ' +
-        'on the photo, so it does NOT need to match the original\'s length line-for-line — prioritize a natural, correctly ' +
-        'worded sentence over matching length. Reply with ONLY a raw JSON array of strings — no markdown, no code ' +
-        'fence, no commentary — with exactly ' + lines.length + ' items in order.',
+      system: buildLinesSystemPrompt(fromName, toName, lines.length),
       messages: [{ role: 'user', content: numbered }],
     }),
   });
@@ -751,16 +851,49 @@ async function translateLinesSequentially(lines, fromCode, toCode, userId) {
   }
   return { translated: out, engine: (engine || 'unknown') + '-per-line' };
                    }
+// Server-side mirror of the client's hasTranslatableLetters (index.html) —
+// same rule: a real word is never just one stray letter surrounded by
+// symbols/digits, so require a 2+ letter run before treating text as
+// something that should have been translated.
+function hasTranslatableLetters(text) {
+  return /\p{L}{2,}/u.test(String(text || ''));
+}
+// The batch prompt above is now explicit that every entry it receives has
+// real words in it and must be genuinely translated — but a model can still
+// occasionally ignore that and hand back an empty string for something it
+// privately judged to be "just a heading/logo/brand name". Left alone, that
+// silently skips drawing a translation box for that one line on the photo,
+// so the ORIGINAL text stays visible there — looking like the translation
+// randomly stopped partway through a sentence it actually did translate the
+// rest of. Every genuinely-blank entry gets a one-off retry through the
+// normal single-message pipeline (which has no such "logo" escape hatch)
+// instead of being accepted as-is.
+async function fillEmptyLineTranslations(lines, translated, fromCode, toCode, userId) {
+  const out = translated.slice();
+  for (let i = 0; i < lines.length; i++) {
+    const src = String(lines[i] || '').trim();
+    if (out[i] || !src || !hasTranslatableLetters(src)) continue;
+    try {
+      const r = await translateText(src, fromCode, toCode, [], userId);
+      out[i] = r.translated;
+    } catch (e) {
+      console.warn('[translate-lines] could not fill blank entry ' + i + ' ("' + src.slice(0, 40) + '"): ' + e.message);
+    }
+  }
+  return out;
+}
 async function translateLines(lines, fromCode, toCode, userId) {
   try {
-    const translated = await translateLinesWithWorkersAILLM(lines, fromCode, toCode, userId);
+    let translated = await translateLinesWithWorkersAILLM(lines, fromCode, toCode, userId);
+    translated = await fillEmptyLineTranslations(lines, translated, fromCode, toCode, userId);
     return { translated, engine: 'workers-ai-llm-lines' };
   } catch (llmErr) {
     try {
-      const translated = await translateLinesWithClaude(lines, fromCode, toCode);
+      let translated = await translateLinesWithClaude(lines, fromCode, toCode);
       if (looksSuspiciousLinesTranslation(lines, translated, fromCode, toCode)) {
         throw new Error('claude-lines-echoed-untranslated-block');
       }
+      translated = await fillEmptyLineTranslations(lines, translated, fromCode, toCode, userId);
       return { translated, engine: 'claude-lines', workersAiLlmError: llmErr.message };
     } catch (claudeErr) {
       try {
@@ -874,7 +1007,7 @@ async function translateWithLibreTranslate(text, fromCode, toCode) {
   const timer = setTimeout(() => controller.abort(), 10000);
   try {
     const resp = await fetch(url, {
-      method: 'POST',
+method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ q: text, source: fromCode, target: toCode, format: 'text' }),
       signal: controller.signal,
@@ -929,7 +1062,6 @@ async function naturalizeWithGroq(text, fromCode, toCode, dialectHints = {}) {
   if (!out) throw new Error('groq-naturalizer-bad-response');
   return out;
 }
-
 async function naturalizeWithGemini(text, fromCode, toCode, dialectHints = {}) {
   if (!GEMINI_API_KEY) throw new Error('no-gemini-key');
   const { system, user } = buildNaturalizerPrompt(text, fromCode, toCode, dialectHints);
@@ -1097,6 +1229,29 @@ const WIN_EPOCH = 11644473600;
 function escapeXml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
+// --- Loanword accent markers (mirror of the client-side copy in index.html) --
+// The translation prompt above asks the model to wrap a genuine loanword like
+// "okay" as {{اوکی|okay}} — native-script spelling first, original spelling
+// after "|". Edge TTS's SSML can switch just that one word to a real accent
+// via <lang>; engines that can't (ElevenLabs, the Google fallback) instead
+// get the marker stripped down to its native-script spelling.
+const LOANWORD_MARKER_RE = /\{\{([^{}|]+)\|([^{}]+)\}\}/g;
+function stripLoanwordMarkers(text) {
+  LOANWORD_MARKER_RE.lastIndex = 0;
+  return String(text || '').replace(LOANWORD_MARKER_RE, (m, native) => native);
+}
+function buildLoanwordSsmlBody(text) {
+  const s = String(text || '');
+  let out = '', last = 0, m;
+  LOANWORD_MARKER_RE.lastIndex = 0;
+  while ((m = LOANWORD_MARKER_RE.exec(s))) {
+    out += escapeXml(s.slice(last, m.index));
+    out += "<lang xml:lang='en-US'>" + escapeXml(m[2]) + '</lang>';
+    last = m.index + m[0].length;
+  }
+  out += escapeXml(s.slice(last));
+  return out;
+}
 const EDGE_CLIENT_VERSION = '1-143.0.3650.75';
 function synthesizeEdgeTts(text, bcp, gender) {
   return new Promise((resolve, reject) => {
@@ -1133,7 +1288,7 @@ function synthesizeEdgeTts(text, bcp, gender) {
       ws.send('X-Timestamp:' + ts + '\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n'
         + '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}');
       const ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='" + voice.slice(0, 5) + "'>"
-        + "<voice name='" + voice + "'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>" + escapeXml(text) + "</prosody></voice></speak>";
+        + "<voice name='" + voice + "'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>" + buildLoanwordSsmlBody(text) + "</prosody></voice></speak>";
       ws.send('X-RequestId:' + uuidNoDashes() + '\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:' + ts + 'Z\r\nPath:ssml\r\n\r\n' + ssml);
     });
     ws.on('message', (data, isBinary) => {
@@ -1286,6 +1441,55 @@ const server = http.createServer(async (req, res) => {
     }
     return;
 }
+  if (req.method === 'POST' && req.url === '/retry-same-model') {
+    try {
+      const body = await readJsonBody(req, 5000);
+      const { userId, fromCode, toCode, text, engine, model, previousTranslation, context, dialectHints } = body;
+      if (!userId || !fromCode || !toCode || !text || !engine) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'userId, fromCode, toCode, text و engine لازم است' }));
+        return;
+      }
+      const safeUserId = String(userId).slice(0, 80);
+      const safeFromCode = String(fromCode).slice(0, 10);
+      const safeToCode = String(toCode).slice(0, 10);
+      const safeText = String(text).slice(0, 4000);
+      const safeEngine = String(engine).slice(0, 40);
+      const safeModel = model ? String(model).slice(0, 120) : null;
+      const safePrevious = previousTranslation ? String(previousTranslation).slice(0, 2000) : null;
+      const safeContext = Array.isArray(context) ? context : [];
+      const safeHints = dialectHints && typeof dialectHints === 'object' ? dialectHints : {};
+      let retried = false;
+      let fellBack = false;
+      let result;
+      try {
+        const translated = await retranslateWithSameEngineModel({
+          text: safeText, fromCode: safeFromCode, toCode: safeToCode, context: safeContext,
+          userId: safeUserId, dialectHints: safeHints, engine: safeEngine, model: safeModel,
+          previousTranslation: safePrevious,
+        });
+        retried = true;
+        result = { translated, engine: safeEngine, model: safeModel };
+      } catch (err) {
+        console.warn('[retry-same-model] same-model retry did not work out (' + safeEngine + (safeModel ? '/' + safeModel : '') + '): ' + err.message + ' — falling back to the normal engine chain');
+        // Only Workers AI LLM pool models are ever actually rotated away from a
+        // given user for a given language — this is the ONE place that exclusion
+        // gets recorded, and only once the same model has already had its own
+        // fair retry and still came back bad/suspicious.
+        if (safeModel && LLM_MODEL_POOL.includes(safeModel)) {
+          registerDislike(safeUserId, safeModel, safeToCode);
+        }
+        result = await translateText(safeText, safeFromCode, safeToCode, safeContext, safeUserId, safeHints);
+        fellBack = true;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, retried, fellBack, ...result }));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message || 'تلاش دوباره برای ترجمه انجام نشد' }));
+    }
+    return;
+  }
  if (req.method === 'POST' && req.url === '/correction') {
     try {
       const body = await readJsonBody(req, 5000);
@@ -1360,15 +1564,17 @@ if (req.method === 'POST' && req.url === '/tts') {
       console.log('[tts] request bcp=' + String(bcp) + ' gender=' + String(gender || '-') + ' chars=' + String(text).length);
       let audio, engine;
       try {
-        audio = await synthesizeElevenLabsTts(String(text));
+        audio = await synthesizeElevenLabsTts(stripLoanwordMarkers(String(text)));
         engine = 'elevenlabs';
       } catch (elevenErr) {
         try {
+          // Edge TTS is the only engine here that actually honors the loanword
+          // accent marker (see buildLoanwordSsmlBody) — it gets the raw text.
           audio = await synthesizeEdgeTts(String(text), String(bcp), gender);
           engine = 'edge';
         } catch (edgeErr) {
           try {
-            audio = await synthesizeGoogleTts(String(text), String(bcp).slice(0, 2));
+            audio = await synthesizeGoogleTts(stripLoanwordMarkers(String(text)), String(bcp).slice(0, 2));
             engine = 'google-fallback';
           } catch (googleErr) {
             console.error('[tts] ALL ENGINES FAILED bcp=' + String(bcp) + ' elevenlabs=' + elevenErr.message + ' | edge=' + edgeErr.message + ' | google=' + googleErr.message);
@@ -1397,7 +1603,7 @@ const status = [
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Whisper transcription (Workers AI) configured' : 'Whisper transcription (Workers AI) NOT configured',
     ELEVENLABS_API_KEY ? 'ElevenLabs TTS configured' : 'ElevenLabs TTS NOT configured',
     'Edge TTS + Google TTS fallback available at POST /tts',
-    'Model dislike feedback: POST /feedback, status: GET /model-status?lang=xx',
+    'Model dislike feedback: POST /feedback, same-model retry: POST /retry-same-model, status: GET /model-status?lang=xx',
     'Per-user correction memory: POST /correction',
     kvConfigured() ? 'Persistence: Cloudflare KV (survives restarts)' : 'Persistence: local disk file only (LOST on restart if your host has an ephemeral disk — set CF_KV_NAMESPACE_ID to fix)',
   ].join(', ');
@@ -1471,6 +1677,7 @@ wss.on('connection', (ws) => {
         fromPhoto: !!msg.fromPhoto,
         photoPng: msg.photoPng || null,
         model: msg.model || null,
+        engine: msg.engine || null,
         targetLang: msg.targetLang || null,
         gender: msg.gender || null,
         msgId: msg.msgId || null,
@@ -1517,6 +1724,28 @@ wss.on('connection', (ws) => {
       if (!s || !msg.msgId) return;
       const target = otherSide(s, ws.role);
       const payload = { type: 'correction', msgId: String(msg.msgId), translated: msg.translated };
+      if (target && target.readyState === target.OPEN) {
+        send(target, payload);
+      } else {
+        const targetRole = ws.role === 'host' ? 'guest' : 'host';
+        s.pending = s.pending || [];
+        s.pending.push({ role: targetRole, payload });
+        if (s.pending.length > 200) s.pending.shift();
+      }
+      return;
+    }
+    // Someone picked (or cleared) a reaction emoji on a message — relay the new
+    // state to the other side's copy of that same message by msgId, so a
+    // reaction on either person's screen shows up on both. Same relay +
+    // pending-queue-on-disconnect pattern as 'correction'/'delivered'/'seen'
+    // above. msg.emoji is a short emoji string, or null/absent to clear it —
+    // never trusted as arbitrary long text, just capped and passed through.
+    if (msg.type === 'reaction') {
+      const s = sessions.get(ws.code);
+      if (!s || !msg.msgId) return;
+      const target = otherSide(s, ws.role);
+      const emoji = (typeof msg.emoji === 'string' && msg.emoji) ? msg.emoji.slice(0, 8) : null;
+      const payload = { type: 'reaction', msgId: String(msg.msgId), emoji };
       if (target && target.readyState === target.OPEN) {
         send(target, payload);
       } else {
