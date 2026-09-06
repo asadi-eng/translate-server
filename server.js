@@ -64,26 +64,30 @@ async function kvPutJSON(key, value) {
   }
 }
 const CF_TRANSLATE_MODEL = '@cf/meta/m2m100-1.2b';
-// LLM_MODEL_POOL: no per-language "this model is scientifically best for Turkish"
-// data exists, so instead of guessing 26 "optimal" models we keep one pool of
-// solid general-purpose multilingual chat models on Workers AI (all free-tier,
-// no card needed) and try them IN ORDER for every language. If the first one
-// fails outright, or comes back with a clearly bad answer, the next one in the
-// list is tried automatically before we ever fall back to the literal M2M-100
-// engine. Order = our best-effort default priority, not a proven ranking.
+// LLM_MODEL_POOL: deliberately kept to ONE model — the strongest free-tier
+// multilingual instruct model on Workers AI. This used to be a 4-model chain
+// (70b -> 8b -> mistral-24b -> qwen-32b) that silently rotated down to a
+// visibly weaker model the moment the strong one looked even slightly
+// suspicious. That's exactly the failure users were hitting: a bad first
+// roll would get "fixed" by downgrading quality instead of genuinely
+// retrying. Now there is nothing weaker to fall back to within this pool —
+// a person hitting 🔄 (retry-same-model, see retranslateWithSameEngineModel)
+// always gets another honest attempt from this SAME strong model. If it
+// truly can't produce anything usable, the caller falls through to the
+// other translateText() engines (Claude, then the literal fallback
+// engines) — never to a weaker model still labeled "AI translation".
 const LLM_MODEL_POOL = [
-  '@cf/meta/llama-3.3-70b-instruct-fp8-fast', // primary — much stronger than the 8b model below, still free-tier (uses more of the daily neuron quota per request, so it'll run out sooner on heavy days — that's why the smaller ones stay below it as fallback)
-  '@cf/meta/llama-3.1-8b-instruct',            // 2nd try — confirmed free-tier, solid multilingual instruct model
-  '@cf/mistralai/mistral-small-3.1-24b-instruct', // 3rd try — different model family/training data, free-tier
-  '@cf/qwen/qwen2.5-coder-32b-instruct',        // 4th try — another independent fallback, free-tier
+  '@cf/meta/llama-3.3-70b-instruct-fp8-fast', // the one and only model in this pool — see note above
 ];
-// NOTE: glm-4.7-flash and kimi-k2.6 (previously in this pool) now require the
-// Workers AI PAID plan — they return HTTP 403 "not available on the Workers
-// Free plan" on a free account. gemma-4-26b-a4b-it was returning empty
-// responses (workers-ai-llm-bad-response). Swap models here freely if
-// Cloudflare's free-tier catalog changes again — check
+// Previously-tried weaker fallbacks (llama-3.1-8b-instruct,
+// mistral-small-3.1-24b-instruct, qwen2.5-coder-32b-instruct) were removed on
+// purpose — do not add them back as "just in case" fallbacks; that recreates
+// the silent-downgrade problem this pool was trimmed to avoid. If Cloudflare's
+// catalog changes and a genuinely comparable-or-better free-tier model shows
+// up, it can replace the entry above — check
 // https://developers.cloudflare.com/workers-ai/models/ for current model IDs
-// and which ones are Free vs Paid before adding one back to this pool.
+// and which ones are Free vs Paid. (glm-4.7-flash and kimi-k2.6 now require
+// the Workers AI PAID plan; gemma-4-26b-a4b-it was returning empty responses.)
 const CF_LLM_TRANSLATE_MODEL = LLM_MODEL_POOL[0]; // kept for status/log text below
 // SMART LANGUAGE ROUTER — Groq/Gemini priority by target language; no Cloudflare key required.
 const LANGUAGE_ENGINE_ROUTER = {
@@ -492,7 +496,7 @@ async function translateWithGemini(text, fromCode, toCode, context = [], dialect
     );
   } finally {
     clearTimeout(timer);
-  }
+    }
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
     throw new Error('gemini-http-' + resp.status + (body ? ': ' + body.slice(0, 200) : ''));
@@ -682,7 +686,7 @@ async function retranslateWithSameEngineModel({ text, fromCode, toCode, context,
     case 'claude':
       translated = await translateWithClaude(text, fromCode, toCode, context, dialectHints, corrections, previousTranslation);
       break;
-case 'workers-ai-llm':
+    case 'workers-ai-llm':
       if (!model) throw new Error('retry-missing-model-for-workers-ai-llm');
       translated = await translateWithWorkersAILLM(text, fromCode, toCode, context, model, dialectHints, corrections, previousTranslation);
       break;
@@ -1007,7 +1011,7 @@ async function translateWithLibreTranslate(text, fromCode, toCode) {
   const timer = setTimeout(() => controller.abort(), 10000);
   try {
     const resp = await fetch(url, {
-method: 'POST',
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ q: text, source: fromCode, target: toCode, format: 'text' }),
       signal: controller.signal,
@@ -1103,60 +1107,69 @@ async function naturalizeTranslation(translated, fromCode, toCode, dialectHints 
   }
   return { translated, naturalized: false, naturalizer: null };
 }
+// PINNED SINGLE ENGINE, NO SILENT CROSS-ENGINE FALLBACK.
+// This used to be an 8-engine chain (strong LLM -> weaker LLM -> literal
+// machine-translation services) that would quietly keep sliding down to a
+// lower-quality engine on any hiccup from the good ones. Same problem as
+// LLM_MODEL_POOL above, one level up: a person could ask for Groq/Gemini
+// quality and transparently get Google-Translate-tier output instead, with
+// nothing on screen saying so except the small engine badge.
+// Now there is exactly ONE engine per call, chosen like this:
+//   - Manual pick in Settings (preferredEngine) -> that exact engine, always.
+//     Nothing else is ever substituted for it. If it fails, translation
+//     fails — the person picked it on purpose, so silently swapping it out
+//     from under them would defeat the point of picking it.
+//   - "Auto" (no manual pick) -> the ONE strong engine LANGUAGE_ENGINE_ROUTER
+//     designates for that target language (Groq or Gemini — see the router
+//     above), and only that one. No drop-down through workers-ai-llm, Claude,
+//     or the literal fallback engines (M2M-100/DeepL/Google/LibreTranslate).
+// The literal fallback engines (translateWithWorkersAI/DeepL/Google/
+// LibreTranslate) and the secondary LLM options (workers-ai-llm, claude) are
+// NOT deleted — they still work fine and stay reachable by manually picking
+// them in Settings (SELECTABLE_ENGINES). They're just no longer something the
+// server ever switches you into behind your back.
+// Logged the same way translation results have always been logged here
+// (console.log('[translate] ...') on success, console.error on failure) and
+// surfaced the same way on the client (setTranslationEngineBadge) — this
+// change is about WHICH engine gets picked, not about how it's reported.
+const ENGINE_RUNNERS = {
+  'groq': (text, fromCode, toCode, context, dialectHints, corrections) =>
+    ({ model: GROQ_MODEL, run: () => translateWithGroq(text, fromCode, toCode, context, dialectHints, corrections) }),
+  'gemini': (text, fromCode, toCode, context, dialectHints, corrections) =>
+    ({ model: GEMINI_MODEL, run: () => translateWithGemini(text, fromCode, toCode, context, dialectHints, corrections) }),
+  'workers-ai-llm': (text, fromCode, toCode, context, dialectHints, corrections, userId) =>
+    ({ model: null, run: () => translateWithLLMChain(text, fromCode, toCode, context, userId, dialectHints) }),
+  'claude': (text, fromCode, toCode, context, dialectHints, corrections) =>
+    ({ model: CLAUDE_MODEL, run: () => translateWithClaude(text, fromCode, toCode, context, dialectHints, corrections) }),
+  'workers-ai-fallback': (text, fromCode, toCode) =>
+    ({ model: CF_TRANSLATE_MODEL, run: () => translateWithWorkersAI(text, fromCode, toCode) }),
+  'deepl-fallback': (text, fromCode, toCode) =>
+    ({ model: 'deepl', run: () => translateWithDeepL(text, fromCode, toCode) }),
+  'google-fallback': (text, fromCode, toCode) =>
+    ({ model: 'google-translate', run: () => translateWithGoogle(text, fromCode, toCode) }),
+  'libretranslate-fallback': (text, fromCode, toCode) =>
+    ({ model: 'libretranslate', run: () => translateWithLibreTranslate(text, fromCode, toCode) }),
+};
 async function translateText(text, fromCode, toCode, context = [], userId = null, dialectHints = {}, preferredEngine = null) {
   const started = Date.now();
-  const errors = {};
   const corrections = getCorrectionsFor(userId, toCode);
-  // Order = best free (no credit card) quality first, most limited/oldest engines
-  // last. Any engine whose API key/credentials aren't configured just throws
-  // immediately (e.g. 'no-groq-key') and the chain moves on with no delay.
-const preferredLanguageEngine = getLanguageEngine(toCode);
-let engines = preferredLanguageEngine === 'gemini'
-  ? [
-      { name:'gemini', model:GEMINI_MODEL, run:()=>translateWithGemini(text,fromCode,toCode,context,dialectHints,corrections) },
-      { name:'groq', model:GROQ_MODEL, run:()=>translateWithGroq(text,fromCode,toCode,context,dialectHints,corrections) },
-      { name:'workers-ai-llm', run:()=>translateWithLLMChain(text,fromCode,toCode,context,userId,dialectHints) },
-      { name:'claude', model:CLAUDE_MODEL, run:()=>translateWithClaude(text,fromCode,toCode,context,dialectHints,corrections) },
-      { name:'workers-ai-fallback', model:CF_TRANSLATE_MODEL, run:()=>translateWithWorkersAI(text,fromCode,toCode) },
-      { name:'deepl-fallback', model:'deepl', run:()=>translateWithDeepL(text,fromCode,toCode) },
-      { name:'google-fallback', model:'google-translate', run:()=>translateWithGoogle(text,fromCode,toCode) },
-      { name:'libretranslate-fallback', model:'libretranslate', run:()=>translateWithLibreTranslate(text,fromCode,toCode) }
-    ]
-  : [
-      { name:'groq', model:GROQ_MODEL, run:()=>translateWithGroq(text,fromCode,toCode,context,dialectHints,corrections) },
-      { name:'gemini', model:GEMINI_MODEL, run:()=>translateWithGemini(text,fromCode,toCode,context,dialectHints,corrections) },
-      { name:'workers-ai-llm', run:()=>translateWithLLMChain(text,fromCode,toCode,context,userId,dialectHints) },
-      { name:'claude', model:CLAUDE_MODEL, run:()=>translateWithClaude(text,fromCode,toCode,context,dialectHints,corrections) },
-      { name:'workers-ai-fallback', model:CF_TRANSLATE_MODEL, run:()=>translateWithWorkersAI(text,fromCode,toCode) },
-      { name:'deepl-fallback', model:'deepl', run:()=>translateWithDeepL(text,fromCode,toCode) },
-      { name:'google-fallback', model:'google-translate', run:()=>translateWithGoogle(text,fromCode,toCode) },
-      { name:'libretranslate-fallback', model:'libretranslate', run:()=>translateWithLibreTranslate(text,fromCode,toCode) }
-    ];
-  // The person chose a specific engine in Settings instead of "auto" — try that
-  // one first, then still fall through to the rest of the chain on failure so a
-  // translation still comes back rather than a hard error.
-  if (preferredEngine && SELECTABLE_ENGINES.includes(preferredEngine)) {
-    const picked = engines.find((e) => e.name === preferredEngine);
-    if (picked) {
-      engines = [picked, ...engines.filter((e) => e.name !== preferredEngine)];
-    }
+  const engineName = (preferredEngine && SELECTABLE_ENGINES.includes(preferredEngine))
+    ? preferredEngine
+    : getLanguageEngine(toCode);
+  const engine = ENGINE_RUNNERS[engineName](text, fromCode, toCode, context, dialectHints, corrections, userId);
+  try {
+    const result = await engine.run();
+    // translateWithLLMChain resolves to { translated, model }; every other
+    // engine resolves to a plain translated string.
+    const translated = (result && typeof result === 'object') ? result.translated : result;
+    const model = (result && typeof result === 'object' && result.model) ? result.model : engine.model;
+    const naturalized = await naturalizeTranslation(translated, fromCode, toCode, dialectHints, engineName);
+    console.log('[translate] ' + engineName + (model ? ' (' + model + ')' : '') + ' OK naturalizer=' + (naturalized.naturalizer || 'none') + ' ms=' + (Date.now() - started));
+    return { translated: naturalized.translated, engine: engineName, model, naturalized: naturalized.naturalized, naturalizer: naturalized.naturalizer };
+  } catch (err) {
+    console.error('[translate] ' + engineName + ' FAILED (pinned single-engine — no fallback engine tried) error=' + err.message);
+    throw new Error(engineName + ' failed: ' + err.message);
   }
-  for (const engine of engines) {
-    try {
-      const result = await engine.run();
-      // translateWithLLMChain resolves to { translated, model }; every other
-      // engine resolves to a plain translated string.
-      const translated = (result && typeof result === 'object') ? result.translated : result;
-      const model = (result && typeof result === 'object' && result.model) ? result.model : engine.model;
-      const naturalized = await naturalizeTranslation(translated, fromCode, toCode, dialectHints, engine.name);
-      console.log('[translate] ' + engine.name + (model ? ' (' + model + ')' : '') + ' OK naturalizer=' + (naturalized.naturalizer || 'none') + ' ms=' + (Date.now() - started));
-      return { translated: naturalized.translated, engine: engine.name, model, naturalized: naturalized.naturalized, naturalizer: naturalized.naturalizer, ...errors };
-    } catch (err) {
-      console.error('[translate] ' + engine.name + ' FAILED error=' + err.message);
-      errors[engine.name + 'Error'] = err.message;
-    }
-  }
-  throw new Error('all engines failed — ' + Object.entries(errors).map(([k, v]) => k + ': ' + v).join(' | '));
 }
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
