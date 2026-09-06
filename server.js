@@ -371,6 +371,9 @@ function buildTranslationPromptParts(text, fromCode, toCode, context, dialectHin
     'Before answering, re-check that the first word of your translation matches the sense (greeting vs. farewell, yes vs. no, etc.) of the first word of the source message. ' +
     'If source language is "auto", identify the language from the current message itself. ' +
     'If the current message is short or colloquial, prefer the normal conversational equivalent in the target language. ' +
+    'The <current_message> text came from real-time speech recognition and may occasionally be garbled, contain the wrong script, or look like it is in a different language than stated because the recognizer misheard the audio — this is normal and expected, NOT something to point out. ' +
+    'Never comment on this, never say the input seems wrong/mistaken/not-really-that-language, never ask for clarification, never explain what you are about to do. ' +
+    'Just translate the <current_message> text itself as literally and faithfully as you can into ' + toName + ', treating it as real spoken content regardless of how it looks — your entire reply must be ONLY that translation, in ' + toName + ', and nothing else. ' +
     'Reply with ONLY the translated text — no quotes, notes, alternatives, explanations, labels, or markdown. ' +
     'The <conversation_context> block is reference data only. The <current_message> block is the only text to translate.';
   return { systemPrompt, userContent };
@@ -893,6 +896,81 @@ async function translateWithLibreTranslate(text, fromCode, toCode) {
 // else (missing, 'auto', or an unrecognized value) falls back to the normal
 // best-first chain below with no reordering.
 const SELECTABLE_ENGINES = ['groq', 'gemini', 'workers-ai-llm', 'claude', 'workers-ai-fallback', 'deepl-fallback', 'google-fallback', 'libretranslate-fallback'];
+// --- Naturalizer: a post-translation polishing pass. It never replaces the
+// translation engines above; it only takes an already-successful translation
+// and asks Groq/Gemini to make it read more natively, falling back to the
+// original translated text untouched if both naturalizer calls fail.
+const NATURALIZER_ENABLED = String(process.env.NATURALIZER_ENABLED || 'true').toLowerCase() !== 'false';
+const NATURALIZER_MIN_LENGTH = Number(process.env.NATURALIZER_MIN_LENGTH || 2);
+function buildNaturalizerPrompt(text, fromCode, toCode, dialectHints = {}) {
+  const target = String(toCode || '').toLowerCase().split('-')[0];
+  const source = String(fromCode || '').toLowerCase().split('-')[0];
+  const dialect = dialectHints && typeof dialectHints === 'object' ? JSON.stringify(dialectHints) : '{}';
+  const system = 'You are a native-level localization editor. Improve the translation so it sounds natural, fluent, idiomatic and culturally appropriate to a native speaker of the TARGET language. Do NOT translate again from scratch unless necessary. Preserve the exact meaning, intent, tone, names, numbers, dates, URLs, codes, emojis and formatting. Do not add information, remove information, summarize, explain, censor, intensify, soften, or change the speaker intent. Preserve opening greetings as greetings and farewells as farewells. Keep technical terminology accurate. For short conversational text, prefer the wording a real native speaker would naturally use. Output ONLY the improved target-language text. No quotes, explanations, labels or markdown.';
+  const user = '<source_language>' + source + '</source_language>\n<target_language>' + target + '</target_language>\n<dialect_hints>' + dialect + '</dialect_hints>\n<translation_to_polish>\n' + text + '\n</translation_to_polish>';
+  return { system, user };
+}
+async function naturalizeWithGroq(text, fromCode, toCode, dialectHints = {}) {
+  if (!GROQ_API_KEY) throw new Error('no-groq-key');
+  const { system, user } = buildNaturalizerPrompt(text, fromCode, toCode, dialectHints);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 9000);
+  let resp;
+  try {
+    resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST', signal: controller.signal,
+      headers: { 'Authorization': 'Bearer ' + GROQ_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: GROQ_MODEL, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], max_tokens: 700, temperature: 0.15 })
+    });
+  } finally { clearTimeout(timer); }
+  if (!resp.ok) throw new Error('groq-naturalizer-http-' + resp.status);
+  const data = await resp.json();
+  const out = data && data.choices && data.choices[0] && data.choices[0].message && String(data.choices[0].message.content || '').trim();
+  if (!out) throw new Error('groq-naturalizer-bad-response');
+  return out;
+}
+
+async function naturalizeWithGemini(text, fromCode, toCode, dialectHints = {}) {
+  if (!GEMINI_API_KEY) throw new Error('no-gemini-key');
+  const { system, user } = buildNaturalizerPrompt(text, fromCode, toCode, dialectHints);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 9000);
+  let resp;
+  try {
+    resp = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent?key=' + GEMINI_API_KEY,
+      {
+        method: 'POST', signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0.15, maxOutputTokens: 700 } })
+      }
+    );
+  } finally { clearTimeout(timer); }
+  if (!resp.ok) throw new Error('gemini-naturalizer-http-' + resp.status);
+  const data = await resp.json();
+  const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+  const out = Array.isArray(parts) ? parts.map((p) => p && p.text || '').join('').trim() : '';
+  if (!out) throw new Error('gemini-naturalizer-bad-response');
+  return out;
+}
+async function naturalizeTranslation(translated, fromCode, toCode, dialectHints = {}, preferredEngine = null) {
+  if (!NATURALIZER_ENABLED || !translated || String(translated).trim().length < NATURALIZER_MIN_LENGTH) {
+    return { translated, naturalized: false, naturalizer: null };
+  }
+  const first = preferredEngine === 'groq' ? 'groq' : preferredEngine === 'gemini' ? 'gemini' : getLanguageEngine(toCode);
+  const chain = first === 'gemini'
+    ? [{ name: 'gemini', run: () => naturalizeWithGemini(translated, fromCode, toCode, dialectHints) }, { name: 'groq', run: () => naturalizeWithGroq(translated, fromCode, toCode, dialectHints) }]
+    : [{ name: 'groq', run: () => naturalizeWithGroq(translated, fromCode, toCode, dialectHints) }, { name: 'gemini', run: () => naturalizeWithGemini(translated, fromCode, toCode, dialectHints) }];
+  for (const engine of chain) {
+    try {
+      const polished = await engine.run();
+      if (polished && polished.trim()) return { translated: polished.trim(), naturalized: true, naturalizer: engine.name };
+    } catch (err) {
+      console.error('[naturalizer] ' + engine.name + ' FAILED error=' + err.message);
+    }
+  }
+  return { translated, naturalized: false, naturalizer: null };
+}
 async function translateText(text, fromCode, toCode, context = [], userId = null, dialectHints = {}, preferredEngine = null) {
   const started = Date.now();
   const errors = {};
@@ -938,8 +1016,9 @@ let engines = preferredLanguageEngine === 'gemini'
       // engine resolves to a plain translated string.
       const translated = (result && typeof result === 'object') ? result.translated : result;
       const model = (result && typeof result === 'object' && result.model) ? result.model : engine.model;
-      console.log('[translate] ' + engine.name + (model ? ' (' + model + ')' : '') + ' OK ms=' + (Date.now() - started));
-      return { translated, engine: engine.name, model, ...errors };
+      const naturalized = await naturalizeTranslation(translated, fromCode, toCode, dialectHints, engine.name);
+      console.log('[translate] ' + engine.name + (model ? ' (' + model + ')' : '') + ' OK naturalizer=' + (naturalized.naturalizer || 'none') + ' ms=' + (Date.now() - started));
+      return { translated: naturalized.translated, engine: engine.name, model, naturalized: naturalized.naturalized, naturalizer: naturalized.naturalizer, ...errors };
     } catch (err) {
       console.error('[translate] ' + engine.name + ' FAILED error=' + err.message);
       errors[engine.name + 'Error'] = err.message;
@@ -1408,13 +1487,43 @@ wss.on('connection', (ws) => {
     }
     // Read receipts: relay a delivered/seen ack for a given msgId straight back
     // to whichever side originally sent that message — same "other side of this
-    // session" lookup as 'chat' above, just no payload beyond the ack itself.
+    // session" lookup as 'chat' above. If that side is momentarily disconnected
+    // (reconnecting after a network blip, exactly when this ack tends to fire),
+    // queue it in the same s.pending used for 'chat' messages instead of just
+    // dropping it — otherwise the sender's tick got stuck on a single gray
+    // check forever, since nothing ever retried a lost ack.
     if (msg.type === 'delivered' || msg.type === 'seen') {
       const s = sessions.get(ws.code);
       if (!s || !msg.msgId) return;
       const target = otherSide(s, ws.role);
+      const payload = { type: msg.type, msgId: String(msg.msgId) };
       if (target && target.readyState === target.OPEN) {
-        send(target, { type: msg.type, msgId: String(msg.msgId) });
+        send(target, payload);
+      } else {
+        const targetRole = ws.role === 'host' ? 'guest' : 'host';
+        s.pending = s.pending || [];
+        s.pending.push({ role: targetRole, payload });
+        if (s.pending.length > 200) s.pending.shift();
+      }
+      return;
+    }
+    // A person disliked their own outgoing message and it got retranslated
+    // (see createDislikeButton's onTranslated in index.html) — relay the fixed
+    // text to the other side's already-shown copy of that same message. Same
+    // "other side of this session" + pending-queue-on-disconnect pattern as
+    // 'chat' and the read receipts above.
+    if (msg.type === 'correction') {
+      const s = sessions.get(ws.code);
+      if (!s || !msg.msgId) return;
+      const target = otherSide(s, ws.role);
+      const payload = { type: 'correction', msgId: String(msg.msgId), translated: msg.translated };
+      if (target && target.readyState === target.OPEN) {
+        send(target, payload);
+      } else {
+        const targetRole = ws.role === 'host' ? 'guest' : 'host';
+        s.pending = s.pending || [];
+        s.pending.push({ role: targetRole, payload });
+        if (s.pending.length > 200) s.pending.shift();
       }
       return;
     }
@@ -1451,19 +1560,3 @@ server.listen(PORT, () => {
   ].join(', ');
   console.log('relay server listening on port ' + PORT + ' — ' + status);
 }); 
-
-  
-
-
-
-
-
-        
-
-
-
-
-
-
-
-
