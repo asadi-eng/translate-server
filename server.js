@@ -380,6 +380,8 @@ function buildTranslationPromptParts(text, fromCode, toCode, context, dialectHin
     'Example: translating the English filler "okay" into Persian, when you decide to keep it as a loanword, write {{اوکی|okay}} instead of writing "اوکی" or "okay" alone. ' +
     'Only use this marker for genuine loanwords being kept in their borrowed form — never wrap a normal, fully-translated ' + toName + ' word in it, and never use it for proper nouns. ' +
     'Before answering, re-read your own draft translation and rewrite any leftover source-language word you find (applying the loanword marker above where appropriate), so the final text you send is fully and only in ' + toName + '. ' +
+    'Follow ' + toName + '\'s standard, formal-writing orthography exactly: correct word spacing and correct joining/splitting of compound and suffixed words, not a colloquial or careless spelling of them. ' +
+    'In particular, never insert a spurious space inside a word that is properly written as one connected word — for example in Persian, "همگی" ("all of them/everyone") must be written as a single word, never split into two as "همه گی" or "همه‌ گی". ' +
     'If source language is "auto", identify the language from the current message itself. ' +
     'If the current message is short or colloquial, prefer the normal conversational equivalent in the target language. ' +
     'The <current_message> text came from real-time speech recognition and may occasionally be garbled, contain the wrong script, or look like it is in a different language than stated because the recognizer misheard the audio — this is normal and expected, NOT something to point out. ' +
@@ -730,6 +732,7 @@ function buildLinesSystemPrompt(fromName, toName, lineCount) {
     'Also watch for common English marketing idioms whose literal wording would flip the intended meaning if translated ' +
     'word-for-word — for example "going beyond X" or "more than X" means doing MORE than / in addition to X, never ' +
     'leaving or exiting X; translate the intended sense of the whole phrase, not each word on its own. ' +
+    'Follow ' + toName + '\'s standard, formal-writing orthography exactly — correct word spacing and correct joining/splitting of compound and suffixed words (for example in Persian, "همگی" must stay one word, never split into "همه گی"). ' +
     'Never translate or alter numerals written as figures (e.g. "1", "2024", "۱۲", "01", "2/4"), dates, prices, codes, ' +
     'or standalone symbols/logos — copy those through exactly as they appear in the source text. This does NOT apply ' +
     'to spelled-out number words ("one", "two", "یک", "دو", "سه") — those are ordinary vocabulary and must be ' +
