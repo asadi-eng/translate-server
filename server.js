@@ -1197,6 +1197,29 @@ const ENGINE_RUNNERS = {
   'libretranslate-fallback': (text, fromCode, toCode) =>
     ({ model: 'libretranslate', run: () => translateWithLibreTranslate(text, fromCode, toCode) }),
 };
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+// Quota/rate-limit errors ('-http-429', 'quota', 'rate limit') won't fix
+// themselves within a second, and missing-key errors ('no-groq-key' etc.)
+// never will — retrying either just adds latency for nothing. Everything
+// else (a timed-out fetch, a flaky non-429 HTTP error, or a one-off
+// 'X-bad-response' — an engine returning 200 OK with empty/unparseable
+// content) is the kind of one-off hiccup a single retry often clears.
+function isRetryableEngineError(err) {
+  const msg = String((err && err.message) || err || '');
+  if (/no-[\w-]+-key/i.test(msg)) return false;
+  if (/-http-429\b|quota|rate.?limit/i.test(msg)) return false;
+  return true;
+}
+async function runEngineWithRetry(engine, label) {
+  try {
+    return await engine.run();
+  } catch (err) {
+    if (!isRetryableEngineError(err)) throw err;
+    console.error('[translate] ' + label + ' failed once (' + err.message + ') — retrying once before giving up');
+    await sleep(350);
+    return await engine.run();
+  }
+}
 async function translateText(text, fromCode, toCode, context = [], userId = null, dialectHints = {}, preferredEngine = null) {
   const started = Date.now();
   const corrections = getCorrectionsFor(userId, toCode);
@@ -1204,7 +1227,7 @@ async function translateText(text, fromCode, toCode, context = [], userId = null
   const engineName = manualPick ? preferredEngine : getLanguageEngine(toCode);
   const engine = ENGINE_RUNNERS[engineName](text, fromCode, toCode, context, dialectHints, corrections, userId);
   try {
-    const result = await engine.run();
+    const result = await runEngineWithRetry(engine, engineName);
     // translateWithLLMChain resolves to { translated, model }; every other
     // engine resolves to a plain translated string.
     const translated = (result && typeof result === 'object') ? result.translated : result;
@@ -1219,7 +1242,7 @@ async function translateText(text, fromCode, toCode, context = [], userId = null
       const altName = engineName === 'gemini' ? 'groq' : 'gemini';
       try {
         const altEngine = ENGINE_RUNNERS[altName](text, fromCode, toCode, context, dialectHints, corrections, userId);
-        const altResult = await altEngine.run();
+        const altResult = await runEngineWithRetry(altEngine, altName);
         const translated = (altResult && typeof altResult === 'object') ? altResult.translated : altResult;
         const model = (altResult && typeof altResult === 'object' && altResult.model) ? altResult.model : altEngine.model;
         const naturalized = await naturalizeTranslation(translated, fromCode, toCode, dialectHints, altName);
