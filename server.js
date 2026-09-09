@@ -492,7 +492,7 @@ async function translateWithGemini(text, fromCode, toCode, context = [], dialect
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt }] },
           contents: [{ role: 'user', parts: [{ text: userContent }] }],
-          generationConfig: { temperature: avoidTranslation ? 0.5 : 0.2, maxOutputTokens: 500 },
+          generationConfig: { temperature: avoidTranslation ? 0.5 : 0.2, maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } },
         }),
       }
     );
@@ -1081,7 +1081,7 @@ async function naturalizeWithGemini(text, fromCode, toCode, dialectHints = {}) {
       {
         method: 'POST', signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0.15, maxOutputTokens: 700 } })
+        body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text: user }] }], generationConfig: { temperature: 0.15, maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } } })
       }
     );
   } finally { clearTimeout(timer); }
