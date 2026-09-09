@@ -966,6 +966,50 @@ async function transcribeWithWorkersAI(base64Audio, languageHint) {
   if (typeof text !== 'string') throw new Error('workers-ai-whisper-bad-response');
   return text.trim();
 }
+// Groq Whisper fallback for table-mode speech-to-text
+async function transcribeWithGroq(base64Audio, languageHint) {
+  if (!GROQ_API_KEY) throw new Error('no-groq-key');
+
+  const buf = Buffer.from(base64Audio, 'base64');
+  const blob = new Blob([buf], { type: 'audio/webm' });
+
+  const form = new FormData();
+  form.append('file', blob, 'audio.webm');
+  form.append('model', 'whisper-large-v3-turbo');
+  form.append('response_format', 'json');
+
+  if (languageHint) {
+    form.append('language', String(languageHint));
+  }
+
+  const resp = await fetch(
+    'https://api.groq.com/openai/v1/audio/transcriptions',
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + GROQ_API_KEY,
+      },
+      body: form,
+    }
+  );
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(
+      'groq-whisper-http-' +
+      resp.status +
+      (body ? ': ' + body.slice(0, 200) : '')
+    );
+  }
+
+  const data = await resp.json();
+
+  if (!data || typeof data.text !== 'string') {
+    throw new Error('groq-whisper-bad-response');
+  }
+
+  return data.text.trim();
+}
 function toDeepLTarget(code) {
   if (code === 'en') return 'EN-US';
   return code.toUpperCase();
@@ -1569,12 +1613,48 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'audio (base64) لازم است' }));
         return;
       }
-      if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
-        res.writeHead(503, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'رونویسی صدا تنظیم نشده — CF_ACCOUNT_ID و CF_API_TOKEN را در سرور تنظیم کن' }));
-        return;
-      }
-      const text = await transcribeWithWorkersAI(String(audio), language ? String(language) : undefined);
+      if (!GROQ_API_KEY && !(CF_ACCOUNT_ID && CF_API_TOKEN)) {
+  res.writeHead(503, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    error: 'رونویسی صدا تنظیم نشده — GROQ_API_KEY یا (CF_ACCOUNT_ID و CF_API_TOKEN) را در سرور تنظیم کن'
+  }));
+  return;
+}
+
+const langHint = language ? String(language) : undefined;
+
+let text = null;
+const transcribeErrors = [];
+
+for (const engine of [
+  {
+    name: 'groq',
+    run: () => transcribeWithGroq(String(audio), langHint)
+  },
+  {
+    name: 'workers-ai',
+    run: () => transcribeWithWorkersAI(String(audio), langHint)
+  },
+]) {
+  try {
+    text = await engine.run();
+
+    if (typeof text === 'string') {
+      break;
+    }
+  } catch (err) {
+    transcribeErrors.push(
+      engine.name + ': ' + (err && err.message || err)
+    );
+  }
+}
+
+if (typeof text !== 'string') {
+  throw new Error(
+    transcribeErrors.join(' | ') ||
+    'تبدیل صدا به متن انجام نشد'
+  );
+}
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ text }));
     } catch (err) {
@@ -1631,7 +1711,15 @@ const status = [
     (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Workers AI (M2M-100 fallback) configured' : 'Workers AI (M2M-100 fallback) NOT configured',
     DEEPL_API_KEY ? 'DeepL configured' : 'DeepL NOT configured',
     'Google Translate + LibreTranslate fallbacks always available (no key needed)',
-    (CF_ACCOUNT_ID && CF_API_TOKEN) ? 'Whisper transcription (Workers AI) configured' : 'Whisper transcription (Workers AI) NOT configured',
+    'Table-mode transcription: ' + [
+  GROQ_API_KEY ? 'Groq Whisper OK' : 'Groq Whisper NOT configured',
+  (CF_ACCOUNT_ID && CF_API_TOKEN)
+    ? 'Workers AI Whisper OK'
+    : 'Workers AI Whisper NOT configured',
+].join(', ') +
+((GROQ_API_KEY || (CF_ACCOUNT_ID && CF_API_TOKEN))
+  ? ''
+  : ' — table mode WILL fail on every turn until at least one is set'),
     ELEVENLABS_API_KEY ? 'ElevenLabs TTS configured' : 'ElevenLabs TTS NOT configured',
     'Edge TTS + Google TTS fallback available at POST /tts',
     'Model dislike feedback: POST /feedback, same-model retry: POST /retry-same-model, status: GET /model-status?lang=xx',
