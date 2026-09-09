@@ -1096,10 +1096,10 @@ async function naturalizeTranslation(translated, fromCode, toCode, dialectHints 
   if (!NATURALIZER_ENABLED || !translated || String(translated).trim().length < NATURALIZER_MIN_LENGTH) {
     return { translated, naturalized: false, naturalizer: null };
   }
-  const first = preferredEngine === 'groq' ? 'groq' : preferredEngine === 'gemini' ? 'gemini' : getLanguageEngine(toCode);
-  const chain = first === 'gemini'
-    ? [{ name: 'gemini', run: () => naturalizeWithGemini(translated, fromCode, toCode, dialectHints) }, { name: 'groq', run: () => naturalizeWithGroq(translated, fromCode, toCode, dialectHints) }]
-    : [{ name: 'groq', run: () => naturalizeWithGroq(translated, fromCode, toCode, dialectHints) }, { name: 'gemini', run: () => naturalizeWithGemini(translated, fromCode, toCode, dialectHints) }];
+  const chain = [
+    { name: 'groq', run: () => naturalizeWithGroq(translated, fromCode, toCode, dialectHints) },
+    { name: 'gemini', run: () => naturalizeWithGemini(translated, fromCode, toCode, dialectHints) },
+  ];
   for (const engine of chain) {
     try {
       const polished = await engine.run();
@@ -1156,9 +1156,8 @@ const ENGINE_RUNNERS = {
 async function translateText(text, fromCode, toCode, context = [], userId = null, dialectHints = {}, preferredEngine = null) {
   const started = Date.now();
   const corrections = getCorrectionsFor(userId, toCode);
-  const engineName = (preferredEngine && SELECTABLE_ENGINES.includes(preferredEngine))
-    ? preferredEngine
-    : getLanguageEngine(toCode);
+  const manualPick = !!(preferredEngine && SELECTABLE_ENGINES.includes(preferredEngine));
+  const engineName = manualPick ? preferredEngine : getLanguageEngine(toCode);
   const engine = ENGINE_RUNNERS[engineName](text, fromCode, toCode, context, dialectHints, corrections, userId);
   try {
     const result = await engine.run();
@@ -1171,6 +1170,22 @@ async function translateText(text, fromCode, toCode, context = [], userId = null
     return { translated: naturalized.translated, engine: engineName, model, naturalized: naturalized.naturalized, naturalizer: naturalized.naturalizer };
   } catch (err) {
     console.error('[translate] ' + engineName + ' FAILED (pinned single-engine — no fallback engine tried) error=' + err.message);
+    const isQuotaOrRateLimited = /-http-429\b|quota|rate.?limit/i.test(String(err && err.message || ''));
+    if (!manualPick && isQuotaOrRateLimited && (engineName === 'gemini' || engineName === 'groq')) {
+      const altName = engineName === 'gemini' ? 'groq' : 'gemini';
+      try {
+        const altEngine = ENGINE_RUNNERS[altName](text, fromCode, toCode, context, dialectHints, corrections, userId);
+        const altResult = await altEngine.run();
+        const translated = (altResult && typeof altResult === 'object') ? altResult.translated : altResult;
+        const model = (altResult && typeof altResult === 'object' && altResult.model) ? altResult.model : altEngine.model;
+        const naturalized = await naturalizeTranslation(translated, fromCode, toCode, dialectHints, altName);
+        console.log('[translate] ' + altName + (model ? ' (' + model + ')' : '') + ' OK (fallback from quota-limited ' + engineName + ') naturalizer=' + (naturalized.naturalizer || 'none') + ' ms=' + (Date.now() - started));
+        return { translated: naturalized.translated, engine: altName, model, naturalized: naturalized.naturalized, naturalizer: naturalized.naturalizer };
+      } catch (altErr) {
+        console.error('[translate] ' + altName + ' fallback also FAILED error=' + altErr.message);
+        throw new Error(engineName + ' failed: ' + err.message + ' | ' + altName + ' fallback also failed: ' + altErr.message);
+      }
+    }
     throw new Error(engineName + ' failed: ' + err.message);
   }
 }
