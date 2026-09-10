@@ -988,8 +988,8 @@ async function transcribeWithGroq(base64Audio, languageHint) {
 
   const form = new FormData();
   form.append('file', blob, 'audio.webm');
-  form.append('model', 'whisper-large-v3-turbo');
-  form.append('response_format', 'json');
+  form.append('model', 'whisper-large-v3');
+  form.append('response_format', 'verbose_json');
 
   if (languageHint) {
     form.append('language', String(languageHint));
@@ -1020,7 +1020,16 @@ async function transcribeWithGroq(base64Audio, languageHint) {
   if (!data || typeof data.text !== 'string') {
     throw new Error('groq-whisper-bad-response');
   }
-
+const segments = Array.isArray(data.segments) ? data.segments : null;
+  if (segments && segments.length) {
+    const unreliable = segments.filter(s =>
+      (typeof s.no_speech_prob === 'number' && s.no_speech_prob > 0.6) ||
+      (typeof s.avg_logprob === 'number' && s.avg_logprob < -1.0)
+    );
+    if (unreliable.length === segments.length) {
+      return '';
+    }
+  }
   return data.text.trim();
 }
 function toDeepLTarget(code) {
