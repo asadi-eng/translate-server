@@ -89,14 +89,27 @@ const LLM_MODEL_POOL = [
 // and which ones are Free vs Paid. (glm-4.7-flash and kimi-k2.6 now require
 // the Workers AI PAID plan; gemma-4-26b-a4b-it was returning empty responses.)
 const CF_LLM_TRANSLATE_MODEL = LLM_MODEL_POOL[0]; // kept for status/log text below
-// SMART LANGUAGE ROUTER — Groq/Gemini priority by target language; no Cloudflare key required.
+// QUALITY FALLBACK ROUTER — Groq/Gemini priority by target language. This is
+// no longer the first engine tried automatically (see getLanguageEngine
+// below); Groq's and Gemini's daily/token quotas are shared across everyone
+// using this server and were getting exhausted every day. It's now the
+// automatic SECOND tier: if the free, no-quota Cloudflare Workers AI engine
+// fails or returns a bad result, translateText() falls through to whichever
+// of these two is the "quality" engine for that target language.
 const LANGUAGE_ENGINE_ROUTER = {
   fa:'groq', ar:'groq', en:'gemini', tr:'groq', fr:'gemini', de:'gemini', es:'gemini', it:'gemini',
   ru:'groq', ja:'gemini', ko:'gemini', hi:'gemini', ur:'groq', pt:'gemini', nl:'gemini', sv:'gemini',
   pl:'gemini', uk:'gemini', id:'gemini', vi:'gemini', th:'gemini', he:'gemini', el:'gemini', ro:'gemini',
   bn:'gemini', ms:'gemini'
 };
+// Automatic (non-manual) picks now go to Cloudflare Workers AI first — it's
+// free, has no daily token quota, and CF_ACCOUNT_ID/CF_API_TOKEN are already
+// configured on this server. Groq/Gemini are only reached automatically as a
+// fallback (see translateText below), or by picking them manually in Settings.
 function getLanguageEngine(toCode) {
+  return 'workers-ai-llm';
+}
+function getQualityFallbackEngine(toCode) {
   const code = String(toCode || '').toLowerCase().split('-')[0];
   return LANGUAGE_ENGINE_ROUTER[code] || 'groq';
 }
@@ -1154,27 +1167,34 @@ async function naturalizeTranslation(translated, fromCode, toCode, dialectHints 
   }
   return { translated, naturalized: false, naturalizer: null };
 }
-// PINNED SINGLE ENGINE, NO SILENT CROSS-ENGINE FALLBACK.
+// MANUAL PICK IS PINNED, "AUTO" IS A SMALL FIXED TIER LIST.
 // This used to be an 8-engine chain (strong LLM -> weaker LLM -> literal
 // machine-translation services) that would quietly keep sliding down to a
 // lower-quality engine on any hiccup from the good ones. Same problem as
 // LLM_MODEL_POOL above, one level up: a person could ask for Groq/Gemini
 // quality and transparently get Google-Translate-tier output instead, with
 // nothing on screen saying so except the small engine badge.
-// Now there is exactly ONE engine per call, chosen like this:
+// Two modes, chosen like this:
 //   - Manual pick in Settings (preferredEngine) -> that exact engine, always.
 //     Nothing else is ever substituted for it. If it fails, translation
 //     fails — the person picked it on purpose, so silently swapping it out
 //     from under them would defeat the point of picking it.
-//   - "Auto" (no manual pick) -> the ONE strong engine LANGUAGE_ENGINE_ROUTER
-//     designates for that target language (Groq or Gemini — see the router
-//     above), and only that one. No drop-down through workers-ai-llm, Claude,
-//     or the literal fallback engines (M2M-100/DeepL/Google/LibreTranslate).
+//   - "Auto" (no manual pick) -> a fixed, four-tier fallback, tried in this
+//     order and no further: (1) Cloudflare Workers AI (workers-ai-llm) —
+//     free, no daily token quota, so this is what most translations use
+//     day-to-day; (2) on any failure, whichever of Groq/Gemini
+//     LANGUAGE_ENGINE_ROUTER designates as the quality engine for that
+//     target language; (3) only if that second tier fails with a
+//     quota/rate-limit error, the OTHER of Groq/Gemini; (4) if every LLM
+//     tier above failed, Google Translate (google-fallback) as a last
+//     resort — no key needed, so this is the one tier that should never be
+//     unavailable. This still never drops through Claude or the other
+//     literal fallback engines (M2M-100/DeepL/LibreTranslate) automatically
+//     — those stay manual-only, same as before.
 // The literal fallback engines (translateWithWorkersAI/DeepL/Google/
-// LibreTranslate) and the secondary LLM options (workers-ai-llm, claude) are
-// NOT deleted — they still work fine and stay reachable by manually picking
-// them in Settings (SELECTABLE_ENGINES). They're just no longer something the
-// server ever switches you into behind your back.
+// LibreTranslate) and Claude are NOT deleted — they still work fine and stay
+// reachable by manually picking them in Settings (SELECTABLE_ENGINES).
+// They're just not part of the automatic tier list above.
 // Logged the same way translation results have always been logged here
 // (console.log('[translate] ...') on success, console.error on failure) and
 // surfaced the same way on the client (setTranslationEngineBadge) — this
@@ -1220,42 +1240,69 @@ async function runEngineWithRetry(engine, label) {
     return await engine.run();
   }
 }
+// Tries one engine end-to-end (retry + naturalize) and returns the same
+// shape translateText resolves to, or throws. Shared by the primary attempt
+// and every fallback tier below so the success path only has to be written
+// once.
+async function tryEngine(engineName, text, fromCode, toCode, context, dialectHints, corrections, userId, started, note) {
+  const engine = ENGINE_RUNNERS[engineName](text, fromCode, toCode, context, dialectHints, corrections, userId);
+  const result = await runEngineWithRetry(engine, engineName);
+  // translateWithLLMChain resolves to { translated, model }; every other
+  // engine resolves to a plain translated string.
+  const translated = (result && typeof result === 'object') ? result.translated : result;
+  const model = (result && typeof result === 'object' && result.model) ? result.model : engine.model;
+  const naturalized = await naturalizeTranslation(translated, fromCode, toCode, dialectHints, engineName);
+  console.log('[translate] ' + engineName + (model ? ' (' + model + ')' : '') + ' OK' + (note ? ' (' + note + ')' : '') + ' naturalizer=' + (naturalized.naturalizer || 'none') + ' ms=' + (Date.now() - started));
+  return { translated: naturalized.translated, engine: engineName, model, naturalized: naturalized.naturalized, naturalizer: naturalized.naturalizer };
+}
 async function translateText(text, fromCode, toCode, context = [], userId = null, dialectHints = {}, preferredEngine = null) {
   const started = Date.now();
   const corrections = getCorrectionsFor(userId, toCode);
   const manualPick = !!(preferredEngine && SELECTABLE_ENGINES.includes(preferredEngine));
   const engineName = manualPick ? preferredEngine : getLanguageEngine(toCode);
-  const engine = ENGINE_RUNNERS[engineName](text, fromCode, toCode, context, dialectHints, corrections, userId);
-  try {
-    const result = await runEngineWithRetry(engine, engineName);
-    // translateWithLLMChain resolves to { translated, model }; every other
-    // engine resolves to a plain translated string.
-    const translated = (result && typeof result === 'object') ? result.translated : result;
-    const model = (result && typeof result === 'object' && result.model) ? result.model : engine.model;
-    const naturalized = await naturalizeTranslation(translated, fromCode, toCode, dialectHints, engineName);
-    console.log('[translate] ' + engineName + (model ? ' (' + model + ')' : '') + ' OK naturalizer=' + (naturalized.naturalizer || 'none') + ' ms=' + (Date.now() - started));
-    return { translated: naturalized.translated, engine: engineName, model, naturalized: naturalized.naturalized, naturalizer: naturalized.naturalizer };
-  } catch (err) {
-    console.error('[translate] ' + engineName + ' FAILED (pinned single-engine — no fallback engine tried) error=' + err.message);
-    const isQuotaOrRateLimited = /-http-429\b|quota|rate.?limit/i.test(String(err && err.message || ''));
-    if (!manualPick && isQuotaOrRateLimited && (engineName === 'gemini' || engineName === 'groq')) {
-      const altName = engineName === 'gemini' ? 'groq' : 'gemini';
-      try {
-        const altEngine = ENGINE_RUNNERS[altName](text, fromCode, toCode, context, dialectHints, corrections, userId);
-        const altResult = await runEngineWithRetry(altEngine, altName);
-        const translated = (altResult && typeof altResult === 'object') ? altResult.translated : altResult;
-        const model = (altResult && typeof altResult === 'object' && altResult.model) ? altResult.model : altEngine.model;
-        const naturalized = await naturalizeTranslation(translated, fromCode, toCode, dialectHints, altName);
-        console.log('[translate] ' + altName + (model ? ' (' + model + ')' : '') + ' OK (fallback from quota-limited ' + engineName + ') naturalizer=' + (naturalized.naturalizer || 'none') + ' ms=' + (Date.now() - started));
-        return { translated: naturalized.translated, engine: altName, model, naturalized: naturalized.naturalized, naturalizer: naturalized.naturalizer };
-      } catch (altErr) {
-        console.error('[translate] ' + altName + ' fallback also FAILED error=' + altErr.message);
-        throw new Error(engineName + ' failed: ' + err.message + ' | ' + altName + ' fallback also failed: ' + altErr.message);
-      }
+  // Last-resort tier for auto mode: Google Translate needs no key, has no
+  // meaningful quota for this server's traffic, and is always reachable —
+  // so if every LLM tier above it failed, this is what keeps translation
+  // working at all rather than returning nothing.
+  const tryGoogleLastResort = async (errors) => {
+    try {
+      return await tryEngine('google-fallback', text, fromCode, toCode, context, dialectHints, corrections, userId, started, 'last-resort fallback');
+    } catch (googleErr) {
+      console.error('[translate] google-fallback last-resort also FAILED error=' + googleErr.message);
+      throw new Error(errors.concat(['google-fallback failed: ' + googleErr.message]).join(' | '));
     }
-    throw new Error(engineName + ' failed: ' + err.message);
+  };
+  try {
+    return await tryEngine(engineName, text, fromCode, toCode, context, dialectHints, corrections, userId, started);
+  } catch (err) {
+    console.error('[translate] ' + engineName + ' FAILED' + (manualPick ? ' (manual pick — no fallback engine tried)' : '') + ' error=' + err.message);
+    if (manualPick) throw new Error(engineName + ' failed: ' + err.message);
+    const qualityName = getQualityFallbackEngine(toCode);
+    try {
+      return await tryEngine(qualityName, text, fromCode, toCode, context, dialectHints, corrections, userId, started, 'fallback from ' + engineName);
+    } catch (qualityErr) {
+      console.error('[translate] ' + qualityName + ' fallback also FAILED error=' + qualityErr.message);
+      const isQuotaOrRateLimited = /-http-429\b|quota|rate.?limit/i.test(String(qualityErr && qualityErr.message || ''));
+      if (isQuotaOrRateLimited) {
+        const altName = qualityName === 'gemini' ? 'groq' : 'gemini';
+        try {
+          return await tryEngine(altName, text, fromCode, toCode, context, dialectHints, corrections, userId, started, 'fallback from quota-limited ' + qualityName);
+        } catch (altErr) {
+          console.error('[translate] ' + altName + ' fallback also FAILED error=' + altErr.message);
+          return await tryGoogleLastResort([
+            engineName + ' failed: ' + err.message,
+            qualityName + ' failed: ' + qualityErr.message,
+            altName + ' failed: ' + altErr.message,
+          ]);
+        }
+      }
+      return await tryGoogleLastResort([
+        engineName + ' failed: ' + err.message,
+        qualityName + ' failed: ' + qualityErr.message,
+      ]);
+    }
   }
-}
+              }
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
 async function synthesizeElevenLabsTts(text) {
