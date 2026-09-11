@@ -980,16 +980,23 @@ async function transcribeWithWorkersAI(base64Audio, languageHint) {
   return text.trim();
 }
 // Groq Whisper fallback for table-mode speech-to-text
-async function transcribeWithGroq(base64Audio, languageHint) {
+function extForMime(mimeType) {
+  const m = String(mimeType || '').toLowerCase();
+  if (m.includes('mp4') || m.includes('m4a')) return 'mp4';
+  if (m.includes('ogg')) return 'ogg';
+  if (m.includes('wav')) return 'wav';
+  return 'webm';
+}
+async function transcribeWithGroq(base64Audio, languageHint, mimeType) {
   if (!GROQ_API_KEY) throw new Error('no-groq-key');
 
   const buf = Buffer.from(base64Audio, 'base64');
-  const blob = new Blob([buf], { type: 'audio/webm' });
+  const type = mimeType || 'audio/webm';
+  const blob = new Blob([buf], { type });
 
   const form = new FormData();
-  form.append('file', blob, 'audio.webm');
-  form.append('model', 'whisper-large-v3');
-  form.append('response_format', 'verbose_json');
+  form.append('file', blob, 'audio.' + extForMime(type));
+  form.append('model', 'whisper-large-v3');  form.append('response_format', 'verbose_json');
 
   if (languageHint) {
     form.append('language', String(languageHint));
@@ -1683,10 +1690,24 @@ const server = http.createServer(async (req, res) => {
     }));
     return;
   }
+  // --- Known-mishearing corrections ---------------------------------------
+const MISHEARING_CORRECTIONS = [
+  // "چجوری" (how) is very often misheard as "چه شوری" (something about
+  // saltiness) — the two are near-identical when said at normal speed.
+  { pattern: /چه\s*شوری/g, replacement: 'چجوری' },
+];
+
+function applyKnownMishearingCorrections(text) {
+  let corrected = text;
+  for (const { pattern, replacement } of MISHEARING_CORRECTIONS) {
+    corrected = corrected.replace(pattern, replacement);
+  }
+  return corrected;
+}
   if (req.method === 'POST' && req.url === '/transcribe') {
     try {
       const body = await readJsonBody(req, 15 * 1024 * 1024);
-      const { audio, language } = body;
+      const { audio, language, mimeType } = body;
       if (!audio) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'audio (base64) لازم است' }));
@@ -1706,9 +1727,9 @@ let text = null;
 const transcribeErrors = [];
 
 for (const engine of [
-  {
+{
     name: 'groq',
-    run: () => transcribeWithGroq(String(audio), langHint)
+    run: () => transcribeWithGroq(String(audio), langHint, mimeType ? String(mimeType) : undefined)
   },
   {
     name: 'workers-ai',
@@ -1734,6 +1755,7 @@ if (typeof text !== 'string') {
     'تبدیل صدا به متن انجام نشد'
   );
 }
+      text = applyKnownMishearingCorrections(text);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ text }));
     } catch (err) {
